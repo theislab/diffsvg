@@ -24,8 +24,18 @@ classifiers = [
 ]
 dependencies = [
   "anndata>=0.13",
+  "arviz",
+  "joblib>=1.3",
+  "matplotlib",
+  "numpy",
+  "nutpie",
+  "pandas",
+  "patsy",
+  "pymc",
+  "scipy",
   # for debug logging (referenced from the issue template)
   "session-info2",
+  "tqdm",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://diffsvg.readthedocs.io/"
