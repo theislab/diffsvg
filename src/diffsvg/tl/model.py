@@ -6,9 +6,11 @@ cell to a bin, and stashing the result in ``adata.uns["binned"]``) lives in
 output. The public entry points here are `setup_model` and `fit_model`:
 
 - `setup_model` reads ``adata.uns["binned"]`` (written by
-  `diffsvg.pp.bin_obs`) and builds one PyMC model per gene (for inspection -
-  e.g. `pm.model_to_graphviz`), returning a `DiffSVGModelSetup` bundling
-  them together with everything needed for fitting/prediction. It does no
+  `diffsvg.pp.bin_obs`), validates it against the requested `likelihood`,
+  and returns a `DiffSVGModelSetup` - a lightweight config, not a
+  collection of built models: with potentially thousands of genes, holding
+  a `pm.Model` per gene in memory at once is wasteful when every one of
+  them gets rebuilt from scratch per gene anyway (see below). It does no
   binning itself and does not modify `adata`.
 - `fit_model` samples the posterior of every per-gene model - in parallel,
   across worker processes - samples the posterior predictive on a fixed
@@ -40,15 +42,21 @@ The pattern used here avoids both: everything a per-gene model needs is
 either (a) shared, plain-numpy-array data that does not depend on the gene
 (the spline design matrices `B`/`B_masked`, the encoded `condition` column,
 ...) or (b) a single per-gene vector (`Y`) plus a scalar
-(`intercept_initval`). `setup_model` computes both once, in the main
-process. `fit_model` ships only that lightweight, pure-data payload to each
-worker; the worker then calls the same `_build_gene_model` used by
-`setup_model` to construct its **own private** model from scratch (cheap -
-graph construction, not sampling) and samples it. Every gene's model lives
-in its own process for its entire lifetime, so nothing is ever shared,
+(`intercept_initval`). `diffsvg.pp.bin_obs` computes both once, up front, in
+the main process. Neither `setup_model` nor `fit_model` ever build/hold a
+whole gene's worth of `pm.Model` objects at once - `fit_model` ships only
+that lightweight, pure-data payload to each worker; the worker then calls
+`_build_gene_model` to construct its **own private** model from scratch
+(cheap - graph construction, not sampling) and samples it. Every gene's
+model lives in its own process for its entire lifetime, so nothing is ever
+shared,
 swapped-in-place, or raced across workers.
 """
 
+import contextlib
+import logging
+import os
+import warnings
 from dataclasses import dataclass
 
 import arviz as az
@@ -85,7 +93,15 @@ _LIKELIHOODS = {
 
 @dataclass
 class DiffSVGModelSetup:
-    """Bundle returned by `setup_model` and consumed by `fit_model`.
+    """Config bundle returned by `setup_model` and consumed by `fit_model`.
+
+    Deliberately holds no `pm.Model` objects - just enough configuration to
+    build one for any given gene. `fit_model` builds each gene's model on
+    the fly, per worker, right before sampling it (see the module
+    docstring), so materializing a whole gene panel's worth of models here
+    up front would just be extra memory held for no benefit; to inspect a
+    single gene's model structure (e.g. via `pm.model_to_graphviz`), call
+    `diffsvg.tl.model._build_gene_model` for that one gene directly instead.
 
     Attributes
     ----------
@@ -93,19 +109,11 @@ class DiffSVGModelSetup:
         The `diffsvg.pp.utils.BinnedData` this setup was built from - holds
         `Y`, the shared design matrices, and everything else that does not
         depend on PyMC.
-    models
-        One unsampled `pymc.Model` per gene, for inspection/debugging (e.g.
-        ``pm.model_to_graphviz(setup.models["Gene1"])``). `fit_model` does
-        **not** reuse these directly (see the module docstring) - each
-        worker rebuilds its own equivalent, private model from `binned.Y`/
-        `binned.intercept_initvals` and the shared design matrices on
-        `binned`.
     likelihood
-        Observation model used to build `models`.
+        Observation model every gene's model is built with.
     """
 
     binned: BinnedData
-    models: dict
     likelihood: str
 
 
@@ -148,7 +156,12 @@ def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initv
 
 
 def setup_model(adata, likelihood="normal"):
-    """Define one (unsampled) PyMC GAM per gene, given `adata` pre-processed by `diffsvg.pp.bin_obs`.
+    """Configure the per-gene GAM, given `adata` pre-processed by `diffsvg.pp.bin_obs`.
+
+    This validates `adata`/`likelihood` and bundles them into a
+    `DiffSVGModelSetup` - it does **not** build any `pm.Model`. Actual model
+    construction happens lazily, per gene, once `fit_model` starts fitting
+    (see `DiffSVGModelSetup`), so this is cheap regardless of gene count.
 
     Parameters
     ----------
@@ -168,21 +181,7 @@ def setup_model(adata, likelihood="normal"):
         raise KeyError("adata.uns['binned'] not found - run `diffsvg.pp.bin_obs(adata, ...)` first.")
 
     binned = BinnedData(**adata.uns["binned"])
-
-    models = {
-        gene: _build_gene_model(
-            binned.Y[gene],
-            binned.B,
-            binned.B_masked,
-            binned.condition_fit,
-            binned.n_bsplines,
-            binned.intercept_initvals[gene],
-            likelihood,
-        )
-        for gene in binned.genes
-    }
-
-    return DiffSVGModelSetup(binned=binned, models=models, likelihood=likelihood)
+    return DiffSVGModelSetup(binned=binned, likelihood=likelihood)
 
 
 # ============================================================
@@ -212,6 +211,61 @@ class _FitShared:
     condition_pred_1: np.ndarray
 
 
+@contextlib.contextmanager
+def _quiet_fds():
+    """Redirect the OS-level stdout/stderr file descriptors to `os.devnull`.
+
+    `contextlib.redirect_stdout`/`redirect_stderr` only swap the Python
+    `sys.stdout`/`sys.stderr` objects, which misses writes from compiled
+    extensions that write straight to the process's file descriptors -
+    `nutpie`'s sampler is a Rust extension, so it could. This redirects the
+    actual fds instead, so it catches those too.
+
+    Safe to wrap around code that might raise: a raised exception is a
+    Python object that propagates through the normal call stack (and, here,
+    through `joblib`) regardless of what stdout/stderr are pointed at: it
+    is not lost, and by the time anything prints it (e.g. `joblib` re-
+    raising in the main process), the `finally` below has already restored
+    the real fds.
+    """
+    saved = [os.dup(fd) for fd in (1, 2)]
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        for fd, saved_fd in zip((1, 2), saved):
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        os.close(devnull)
+
+
+@contextlib.contextmanager
+def _quiet_pymc():
+    """Silence PyMC/PyTensor/nutpie's sampler announcements, warnings, and any raw fd output.
+
+    Scoped tightly around the actual `pm.sample`/`pm.sample_posterior_predictive`
+    calls in `_fit_and_predict_gene`, i.e. this runs inside whichever
+    process actually samples (the main process for `n_workers=1`, a worker
+    process otherwise - see the module docstring on why it has to be here
+    rather than configured once up front in `fit_model`). The outer `tqdm`
+    progress bar over completed genes lives in the parent process and
+    writes to stderr there, so it is unaffected either way.
+    """
+    loggers = [logging.getLogger(name) for name in ("pymc", "pytensor", "nutpie")]
+    previous_levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.ERROR)
+    try:
+        with warnings.catch_warnings(), _quiet_fds():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        for logger, level in zip(loggers, previous_levels):
+            logger.setLevel(level)
+
+
 def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs):
     """Build + sample one gene's own private model, then its posterior predictive at both condition levels.
 
@@ -230,7 +284,11 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs):
     )
     n_grid = shared.B_pred.shape[0]
 
-    with model:
+    # Everything below is wrapped in `_quiet_pymc()` (not just `pm.sample`
+    # itself): `pm.sample_posterior_predictive` and `az.rhat`/`az.ess` can
+    # each emit their own logging/warnings too, and the goal here is a
+    # clean run with only the outer progress bar and real errors visible.
+    with model, _quiet_pymc():
         idata = pm.sample(**sample_kwargs)
 
         pm.set_data(
@@ -253,31 +311,31 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs):
         )
         pred1 = pm.sample_posterior_predictive(idata, var_names=["D"], extend_inferencedata=False, progressbar=False)
 
-    draws0 = pred0.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
-    draws1 = pred1.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T
+        draws0 = pred0.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
+        draws1 = pred1.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T
 
-    wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
-    cond0_mean, cond1_mean = draws0.mean(axis=0), draws1.mean(axis=0)
-    cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
-    cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
-    T = compute_T(cond0_mean, cond1_mean)
-    integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
+        wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
+        cond0_mean, cond1_mean = draws0.mean(axis=0), draws1.mean(axis=0)
+        cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
+        cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
+        T = compute_T(cond0_mean, cond1_mean)
+        integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
 
-    diag_vars = ["intercept", "beta", "beta_1", "categorical_beta", "sigma"]
-    n_divergent = int(idata.sample_stats["diverging"].sum()) if "diverging" in idata.sample_stats else 0
+        diag_vars = ["intercept", "beta", "beta_1", "categorical_beta", "sigma"]
+        n_divergent = int(idata.sample_stats["diverging"].sum()) if "diverging" in idata.sample_stats else 0
 
-    # Computed directly from the posterior (rather than via `az.summary`'s
-    # column names, e.g. "hdi_3%"), since those have changed across arviz
-    # versions; `az.rhat`/`az.ess` return a variable -> array mapping
-    # (`.data_vars`) which has stayed stable, so those are used for the
-    # convergence diagnostics.
-    post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
-    ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
+        # Computed directly from the posterior (rather than via `az.summary`'s
+        # column names, e.g. "hdi_3%"), since those have changed across arviz
+        # versions; `az.rhat`/`az.ess` return a variable -> array mapping
+        # (`.data_vars`) which has stayed stable, so those are used for the
+        # convergence diagnostics.
+        post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
+        ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
 
-    rhat_ds = az.rhat(idata, var_names=diag_vars)
-    ess_ds = az.ess(idata, var_names=diag_vars, method="bulk")
-    rhat_max = float(max(np.asarray(rhat_ds[v]).max() for v in rhat_ds.data_vars))
-    ess_bulk_min = float(min(np.asarray(ess_ds[v]).min() for v in ess_ds.data_vars))
+        rhat_ds = az.rhat(idata, var_names=diag_vars)
+        ess_ds = az.ess(idata, var_names=diag_vars, method="bulk")
+        rhat_max = float(max(np.asarray(rhat_ds[v]).max() for v in rhat_ds.data_vars))
+        ess_bulk_min = float(min(np.asarray(ess_ds[v]).min() for v in ess_ds.data_vars))
 
     stats_row = {
         "gene": gene,

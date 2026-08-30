@@ -17,6 +17,161 @@ The three plots below consume those directly.
 import matplotlib.pyplot as plt
 import numpy as np
 
+# ============================================================
+# Label placement helpers (used by plot_volcano)
+# ============================================================
+# Lightweight, dependency-free stand-in for a package like `adjustText`:
+# for each label, try a ring of candidate offsets around its point and use
+# the first one whose (rendered) bounding box doesn't overlap anything
+# already placed; fall back to the least-overlapping candidate. Best-effort,
+# not a guarantee - true only "if possible", as requested.
+
+
+def _get_renderer(fig):
+    try:
+        fig.canvas.draw()
+        return fig.canvas.get_renderer()
+    except Exception:  # noqa: BLE001 - collision avoidance is a nice-to-have, never worth crashing the plot
+        return None
+
+
+def _bbox_tuple(bbox):
+    return (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+
+
+def _boxes_overlap(a, b, pad=2.0):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return not (ax1 + pad < bx0 or bx1 + pad < ax0 or ay1 + pad < by0 or by1 + pad < ay0)
+
+
+def _dot_boxes(ax, xs, ys, marker_size, pad_px=2.0):
+    """Small display-coordinate boxes around each `(x, y)` scatter point, for label-collision checks."""
+    if len(xs) == 0:
+        return []
+    pts = ax.transData.transform(np.column_stack([xs, ys]))
+    r = np.sqrt(marker_size / np.pi) * ax.get_figure().dpi / 72.0 + pad_px
+    return [(px - r, py - r, px + r, py + r) for px, py in pts]
+
+
+def _place_label(
+    ax,
+    renderer,
+    x,
+    y,
+    text,
+    occupied,
+    fontsize=7,
+    color="black",
+    fontweight="normal",
+    preferred_offset=None,
+    base_radius=10.0,
+    n_angles=10,
+    n_rings=4,
+    arrow=False,
+    bbox_kwargs=None,
+    zorder=12,
+):
+    """Place `text` near data point `(x, y)`, avoiding the display-coordinate boxes in `occupied`.
+
+    Tries `preferred_offset` (data units) first if given, then a ring of
+    candidate pixel offsets around the point; picks the first candidate
+    whose label box doesn't overlap anything in `occupied`, or the
+    least-overlapping one if none is fully clear. The chosen box is
+    appended to `occupied` in place, so later calls avoid it too.
+
+    Returns the created `matplotlib.text.Annotation`. If `renderer` is
+    `None` (couldn't be obtained for this backend), skips collision
+    avoidance and just places the label at `preferred_offset` (or the
+    point itself).
+    """
+    point_disp = ax.transData.transform((x, y))
+    arrowprops = {"arrowstyle": "->", "lw": 1.0, "color": color} if arrow else None
+
+    def _measure(dx, dy):
+        # No `arrowprops` here: `Annotation.get_window_extent` includes the
+        # arrow's own bounding box (which reaches all the way back to the
+        # data point), not just the text glyph - measuring that would treat
+        # the arrow's sweep as occupied space and reject candidates for the
+        # wrong reason. The text-only box is what we actually want to keep
+        # labels clear of.
+        cand = ax.transData.inverted().transform((point_disp[0] + dx, point_disp[1] + dy))
+        ann = ax.annotate(
+            text,
+            xy=(x, y),
+            xytext=cand,
+            textcoords="data",
+            fontsize=fontsize,
+            color=color,
+            fontweight=fontweight,
+            ha="center",
+            va="center",
+            zorder=zorder,
+            bbox=bbox_kwargs,
+        )
+        return cand, ann
+
+    def _finalize(cand, ann):
+        if arrowprops is None:
+            return ann
+        ann.remove()
+        return ax.annotate(
+            text,
+            xy=(x, y),
+            xytext=cand,
+            textcoords="data",
+            fontsize=fontsize,
+            color=color,
+            fontweight=fontweight,
+            ha="center",
+            va="center",
+            zorder=zorder,
+            bbox=bbox_kwargs,
+            arrowprops=arrowprops,
+        )
+
+    if renderer is None:
+        dx, dy = (0.0, 0.0) if preferred_offset is None else tuple(
+            ax.transData.transform((x + preferred_offset[0], y + preferred_offset[1])) - point_disp
+        )
+        cand, ann = _measure(dx, dy)
+        return _finalize(cand, ann)
+
+    candidates = []
+    if preferred_offset is not None:
+        pdx, pdy = preferred_offset
+        candidates.append(tuple(ax.transData.transform((x + pdx, y + pdy)) - point_disp))
+    for ring in range(n_rings):
+        radius = base_radius * (1 + ring)
+        for i in range(n_angles):
+            angle = 2 * np.pi * i / n_angles + ring * 0.35
+            candidates.append((np.cos(angle) * radius, np.sin(angle) * radius))
+
+    best, best_score, best_box, best_cand = None, None, None, None
+    for dx, dy in candidates:
+        cand, ann = _measure(dx, dy)
+        box = _bbox_tuple(ann.get_window_extent(renderer=renderer))
+        score = sum(1 for other in occupied if _boxes_overlap(box, other))
+        if score == 0:
+            if best is not None:
+                best.remove()
+            occupied.append(box)
+            return _finalize(cand, ann)
+        # On ties, prefer the later (farther-explored) candidate over the
+        # first one seen: when several labels share nearly the same
+        # preferred position, the first-tried candidate is exactly the one
+        # most likely to collide with a sibling label placed just before it,
+        # so always settling on it would leave them stacked.
+        if best_score is None or score <= best_score:
+            if best is not None:
+                best.remove()
+            best, best_score, best_box, best_cand = ann, score, box, cand
+        else:
+            ann.remove()
+
+    occupied.append(best_box)
+    return _finalize(best_cand, best)
+
 
 def plot_volcano(
     stats_df,
@@ -24,8 +179,9 @@ def plot_volcano(
     pvalue="gamma_pval",
     pvalue_adj="gamma_pval_adj",
     alpha=0.05,
+    show_dots=True,
     n_label=20,
-    highlight_gene=None,
+    highlight_genes=None,
     highlight_offset=(0.025, 1.25),
     ax=None,
     figsize=(4, 6),
@@ -40,23 +196,38 @@ def plot_volcano(
     x
         Column used for the x-axis (area between the two condition curves).
     pvalue
-        Column used for the y-axis, plotted as ``-log10(pvalue)``.
+        Column used for the y-axis, plotted as ``-log10(pvalue)``. Every
+        point above the ``-log10(alpha)`` reference line is colored by the
+        sign of `x` (blue = positive, red = negative); points at or below it
+        are black.
     pvalue_adj
-        Column used to decide significance (colored blue/red) and to rank
-        genes for labeling.
+        Column used to rank genes for labeling (the `n_label` genes with the
+        smallest `pvalue_adj` among those above the line get a text label).
     alpha
-        Significance threshold on `pvalue_adj`; also drawn as a horizontal
-        reference line at ``-log10(alpha)``.
+        Significance threshold on `pvalue`, drawn as a horizontal reference
+        line at ``-log10(alpha)`` and used for the color cutoff described
+        under `pvalue`.
+    show_dots
+        If `True` (default), every gene is drawn as a colored dot. If
+        `False`, every gene's name is drawn instead, in the same color, in
+        place of a dot - there is no separate background scatter in that
+        mode. Best suited to modest gene panels (a few hundred genes);
+        subset `stats_df` first for larger ones.
     n_label
-        Label at most this many significant genes (the ones with the
-        smallest `pvalue_adj`). Use `None` to label every significant gene,
-        or `0` to label none.
-    highlight_gene
-        If given, draw this one gene as a larger, annotated point on top of
-        the rest.
+        Label at most this many of the genes above the line (the ones with
+        the smallest `pvalue_adj`) with their gene name. Use `None` to label
+        every gene above the line, or `0` to label none. Labels use the
+        same collision-avoidance as `highlight_genes` (see below).
+    highlight_genes
+        A gene name, or list of gene names, to draw with a larger red point
+        and a bold, boxed, arrow-annotated label on top of the rest. Raises
+        `KeyError` if any given gene is not in `stats_df.index`.
     highlight_offset
-        ``(dx, dy)`` offset (in data units) of the `highlight_gene` label
-        from its point.
+        ``(dx, dy)`` offset (in data units) tried first for each
+        `highlight_genes` label; if that spot is already occupied (by a
+        dot, another gene's name, or another label), a nearby spot is used
+        instead - so with several highlighted genes this is a preference,
+        not a guarantee.
     ax
         Existing axes to draw into; a new figure is created if omitted.
     figsize
@@ -70,41 +241,73 @@ def plot_volcano(
     """
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
+    fig = ax.get_figure()
+
+    if highlight_genes is None:
+        highlight_genes = []
+    elif isinstance(highlight_genes, str):
+        highlight_genes = [highlight_genes]
+    else:
+        highlight_genes = list(highlight_genes)
+    missing = [g for g in highlight_genes if g not in stats_df.index]
+    if missing:
+        raise KeyError(f"highlight_genes not found in stats_df.index: {missing}")
 
     x_vals = stats_df[x]
     minus_log10_p = -np.log10(stats_df[pvalue])
-    sig = stats_df[pvalue_adj] < alpha
+    threshold = -np.log10(alpha)
+    sig = minus_log10_p > threshold
     pos_sign = x_vals > 0
     neg_sign = x_vals < 0
 
-    ax.scatter(x_vals[~sig], minus_log10_p[~sig], color="black", s=20, alpha=0.7, linewidth=0)
-    ax.scatter(x_vals[sig & pos_sign], minus_log10_p[sig & pos_sign], color="blue", s=20, alpha=0.7, linewidth=0)
-    ax.scatter(x_vals[sig & neg_sign], minus_log10_p[sig & neg_sign], color="red", s=20, alpha=0.7, linewidth=0)
-
     ax.axvline(0, color="black", linestyle="--", lw=1)
-    ax.axhline(-np.log10(alpha), color="gray", linestyle="--", lw=1)
+    ax.axhline(threshold, color="gray", linestyle="--", lw=1)
+
+    renderer = _get_renderer(fig) if (n_label != 0 or highlight_genes or not show_dots) else None
+    occupied = []
+
+    if show_dots:
+        ax.scatter(x_vals[~sig], minus_log10_p[~sig], color="black", s=20, alpha=0.7, linewidth=0)
+        ax.scatter(x_vals[sig & pos_sign], minus_log10_p[sig & pos_sign], color="blue", s=20, alpha=0.7, linewidth=0)
+        ax.scatter(x_vals[sig & neg_sign], minus_log10_p[sig & neg_sign], color="red", s=20, alpha=0.7, linewidth=0)
+        if renderer is not None:
+            occupied.extend(_dot_boxes(ax, x_vals.to_numpy(), minus_log10_p.to_numpy(), marker_size=20))
+    else:
+        for gene in stats_df.index:
+            color = "black" if not sig[gene] else ("blue" if pos_sign[gene] else "red")
+            txt = ax.text(
+                x_vals[gene], minus_log10_p[gene], gene, fontsize=6, color=color, alpha=0.85, ha="center", va="center"
+            )
+            if renderer is not None:
+                occupied.append(_bbox_tuple(txt.get_window_extent(renderer=renderer)))
 
     label_genes = stats_df.index[sig]
     if n_label is not None and len(label_genes) > n_label:
         label_genes = stats_df.loc[label_genes, pvalue_adj].sort_values().index[:n_label]
 
     for gene in label_genes:
-        ax.text(x_vals[gene], minus_log10_p[gene], gene, fontsize=7, ha="left", va="bottom")
+        if gene in highlight_genes:
+            continue  # gets the larger highlight treatment below instead
+        _place_label(ax, renderer, x_vals[gene], minus_log10_p[gene], gene, occupied, fontsize=7, base_radius=8.0)
 
-    if highlight_gene is not None:
-        hx, hy = x_vals[highlight_gene], minus_log10_p[highlight_gene]
-        dx, dy = highlight_offset
+    for gene in highlight_genes:
+        hx, hy = x_vals[gene], minus_log10_p[gene]
         ax.scatter(hx, hy, s=80, color="red", edgecolor="black", linewidth=1.5, zorder=10)
-        ax.annotate(
-            highlight_gene,
-            xy=(hx, hy),
-            xytext=(hx + dx, hy + dy),
-            fontsize=14,
+        _place_label(
+            ax,
+            renderer,
+            hx,
+            hy,
+            gene,
+            occupied,
+            fontsize=13,
             fontweight="bold",
-            color="black",
-            arrowprops={"arrowstyle": "->", "lw": 1.5, "color": "black"},
-            bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "black", "alpha": 0.9},
-            zorder=11,
+            preferred_offset=highlight_offset,
+            base_radius=45.0,
+            n_rings=6,
+            arrow=True,
+            bbox_kwargs={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "black", "alpha": 0.9},
+            zorder=13,
         )
 
     ax.spines["top"].set_visible(False)
@@ -113,7 +316,6 @@ def plot_volcano(
     ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=12)
     ax.tick_params(labelsize=10)
 
-    fig = ax.get_figure()
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
