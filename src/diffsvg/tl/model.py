@@ -235,7 +235,7 @@ def _quiet_fds():
         os.dup2(devnull, 2)
         yield
     finally:
-        for fd, saved_fd in zip((1, 2), saved):
+        for fd, saved_fd in zip((1, 2), saved, strict=True):
             os.dup2(saved_fd, fd)
             os.close(saved_fd)
         os.close(devnull)
@@ -262,7 +262,7 @@ def _quiet_pymc():
             warnings.simplefilter("ignore")
             yield
     finally:
-        for logger, level in zip(loggers, previous_levels):
+        for logger, level in zip(loggers, previous_levels, strict=True):
             logger.setLevel(level)
 
 
@@ -466,16 +466,16 @@ def fit_model(
     -------
     None or tuple[pandas.DataFrame, pandas.DataFrame, dict[str, pandas.DataFrame]]
     """
-    sample_defaults = dict(
-        nuts_sampler="nutpie",
-        draws=1000,
-        tune=1000,
-        chains=4,
-        random_seed=42,
-        compute_convergence_checks=False,
-        init="adapt_diag",
-        progressbar=False,
-    )
+    sample_defaults = {
+        "nuts_sampler": "nutpie",
+        "draws": 1000,
+        "tune": 1000,
+        "chains": 4,
+        "random_seed": 42,
+        "compute_convergence_checks": False,
+        "init": "adapt_diag",
+        "progressbar": False,
+    }
     sample_defaults.update(sample_kwargs or {})
     sample_defaults.update(pymc_kwargs)
 
@@ -578,7 +578,6 @@ def wald_test(beta, cov, contrast=None):
     pval : float
         Chi-square p-value.
     """
-
     beta = np.asarray(beta)
     cov = np.asarray(cov)
 
@@ -629,12 +628,11 @@ def pattern_wald_test(pred0, pred1, ridge=1e-6):
     delta_mean : array
         Mean curve difference
     """
-
     # posterior samples of curve differences
-    delta = pred1 - pred0              # (draws, M)
+    delta = pred1 - pred0  # (draws, M)
 
     # posterior mean difference
-    mu = delta.mean(axis=0)            # (M,)
+    mu = delta.mean(axis=0)  # (M,)
 
     # covariance of contrasts
     Sigma = np.cov(delta, rowvar=False)
@@ -666,8 +664,8 @@ def pattern_wald_test(pred0, pred1, ridge=1e-6):
 
 
 def zscore_curve(x):
-    """
-    Z-score a 1D prediction curve.
+    """Z-score a 1D prediction curve.
+
     Removes mean and scale -> shape-only comparison.
     """
     x = np.asarray(x)
@@ -679,14 +677,13 @@ def zscore_curve(x):
 
 
 def compute_T(curve0, curve1):
-    """
-    Functional L2 distance between two curves.
-    """
+    """Functional L2 distance between two curves."""
     return np.mean((curve1 - curve0) ** 2)
 
 
 def compute_shape_statistics(pred_dict, null_quantile=0.9):
-    """
+    """Compute the tradeSeq-style shape statistic and null p-values for a set of gene curve pairs.
+
     Parameters
     ----------
     pred_dict : dict
@@ -706,7 +703,6 @@ def compute_shape_statistics(pred_dict, null_quantile=0.9):
     -------
     results_df : pd.DataFrame
     """
-
     genes = list(pred_dict.keys())
     T_values = np.array([compute_T(pred0, pred1) for pred0, pred1 in pred_dict.values()])
 

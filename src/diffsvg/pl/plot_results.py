@@ -131,8 +131,10 @@ def _place_label(
         )
 
     if renderer is None:
-        dx, dy = (0.0, 0.0) if preferred_offset is None else tuple(
-            ax.transData.transform((x + preferred_offset[0], y + preferred_offset[1])) - point_disp
+        dx, dy = (
+            (0.0, 0.0)
+            if preferred_offset is None
+            else tuple(ax.transData.transform((x + preferred_offset[0], y + preferred_offset[1])) - point_disp)
         )
         cand, ann = _measure(dx, dy)
         return _finalize(cand, ann)
@@ -368,9 +370,7 @@ def plot_prediction_curve(
         _, ax = plt.subplots(figsize=figsize)
 
     if condition_labels is None:
-        condition_labels = adata.uns.get(
-            f"{curves_key}_condition_categories", {"0": "condition 0", "1": "condition 1"}
-        )
+        condition_labels = adata.uns.get(f"{curves_key}_condition_categories", {"0": "condition 0", "1": "condition 1"})
     if colors is None:
         colors = {0: "steelblue", 1: "darkorange"}
 
