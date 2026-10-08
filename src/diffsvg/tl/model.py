@@ -71,14 +71,75 @@ from tqdm.auto import tqdm
 from diffsvg.pp.utils import BinnedData, build_spline_basis, compute_interior_knots
 
 # ============================================================
-# 1) Likelihoods
+# 1) Priors and likelihoods
 # ============================================================
-# Registry so additional observation models can be added later without
-# touching `_build_gene_model`. Only "normal" is implemented for now.
+# Both are registries, so alternatives can be added without touching the
+# model builders. A prior is written as a tuple ``(distribution, *params)``,
+# with the parameters positional in the order listed below - a form that is
+# easy to vary in a grid (see `check_stability`) and that survives a trip
+# through `adata.uns`.
+
+_PRIOR_DISTRIBUTIONS = {
+    "normal": (pm.Normal, ("mu", "sigma")),
+    "laplace": (pm.Laplace, ("mu", "b")),
+    "studentt": (pm.StudentT, ("nu", "mu", "sigma")),
+    "halfnormal": (pm.HalfNormal, ("sigma",)),
+    "halfcauchy": (pm.HalfCauchy, ("beta",)),
+    "exponential": (pm.Exponential, ("lam",)),
+}
+
+#: The priors the models were hardcoded with before they became configurable,
+#: kept as the defaults so results do not move unless asked.
+DEFAULT_PRIORS = {
+    "intercept": ("normal", 0.0, 1.0),
+    "beta": ("normal", 0.0, 1.0),
+    "beta_1": ("normal", 0.0, 1.0),
+    "categorical_beta": ("normal", 0.0, 1.0),
+    "sigma": ("halfnormal", 1.0),
+}
 
 
-def _normal_likelihood(mu, observed, total_size):
-    sigma = pm.HalfNormal("sigma", 1, initval=0.5)
+def _resolve_priors(priors):
+    """Merge a partial prior spec over `DEFAULT_PRIORS` and validate it.
+
+    Partial on purpose: a sensitivity sweep usually varies one prior and
+    wants the rest left alone, so ``{"beta": ("normal", 0.0, 2.0)}`` is a
+    complete input.
+    """
+    merged = dict(DEFAULT_PRIORS)
+    for name, spec in (priors or {}).items():
+        if name not in DEFAULT_PRIORS:
+            raise ValueError(f"Unknown prior {name!r}. Available: {sorted(DEFAULT_PRIORS)}")
+        merged[name] = tuple(spec)
+
+    for name, spec in merged.items():
+        distribution, *params = spec
+        if distribution not in _PRIOR_DISTRIBUTIONS:
+            raise ValueError(
+                f"Unknown distribution {distribution!r} for prior {name!r}. Available: {sorted(_PRIOR_DISTRIBUTIONS)}"
+            )
+        expected = _PRIOR_DISTRIBUTIONS[distribution][1]
+        if len(params) != len(expected):
+            raise ValueError(
+                f"Prior {name!r}: {distribution!r} takes {len(expected)} parameter(s) {expected}, got {len(params)}."
+            )
+    return merged
+
+
+def _draw_prior(name, spec, shape=None, initval=None):
+    """Instantiate one prior from its ``(distribution, *params)`` tuple."""
+    distribution, *params = spec
+    dist, param_names = _PRIOR_DISTRIBUTIONS[distribution]
+    kwargs = dict(zip(param_names, params, strict=True))
+    if shape is not None:
+        kwargs["shape"] = shape
+    if initval is not None:
+        kwargs["initval"] = initval
+    return dist(name, **kwargs)
+
+
+def _normal_likelihood(mu, observed, total_size, priors):
+    sigma = _draw_prior("sigma", priors["sigma"], initval=0.5)
     return pm.Normal("D", mu=mu, sigma=sigma, observed=observed, total_size=total_size)
 
 
@@ -112,13 +173,20 @@ class DiffSVGModelSetup:
         depend on PyMC.
     likelihood
         Observation model every gene's model is built with.
+    priors
+        Fully resolved prior spec (see `DEFAULT_PRIORS`), i.e. whatever was
+        passed to `setup_model` merged over the defaults.
     """
 
     binned: BinnedData
     likelihood: str
+    priors: dict = None
+
+    def __post_init__(self):
+        self.priors = _resolve_priors(self.priors)
 
 
-def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initval, likelihood="normal"):
+def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initval, likelihood="normal", priors=None):
     """Build the P-spline GAM for a single gene.
 
     `B`/`B_masked`/`condition_arr` (shared across genes, see `setup_model`)
@@ -131,6 +199,7 @@ def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initv
     if likelihood not in _LIKELIHOODS:
         raise ValueError(f"Unknown likelihood {likelihood!r}. Available: {sorted(_LIKELIHOODS)}")
     likelihood_fn = _LIKELIHOODS[likelihood]
+    priors = _resolve_priors(priors)
 
     with pm.Model() as gene_model:
         Y_data = pm.Data("Y_data", np.asarray(Y, dtype=float))
@@ -138,10 +207,10 @@ def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initv
         condition_data = pm.Data("condition_data", np.asarray(condition_arr, dtype=float))
         B_masked_data = pm.Data("B_masked_data", B_masked)
 
-        intercept = pm.Normal("intercept", mu=0, sigma=1, initval=intercept_initval)
-        beta = pm.Normal("beta", mu=0, sigma=1, shape=n_bsplines, initval=np.zeros(n_bsplines))
-        beta_1 = pm.Normal("beta_1", mu=0, sigma=1, shape=n_bsplines, initval=np.zeros(n_bsplines))
-        categorical_beta = pm.Normal("categorical_beta", mu=0, sigma=1, initval=0.0)
+        intercept = _draw_prior("intercept", priors["intercept"], initval=intercept_initval)
+        beta = _draw_prior("beta", priors["beta"], shape=n_bsplines, initval=np.zeros(n_bsplines))
+        beta_1 = _draw_prior("beta_1", priors["beta_1"], shape=n_bsplines, initval=np.zeros(n_bsplines))
+        categorical_beta = _draw_prior("categorical_beta", priors["categorical_beta"], initval=0.0)
 
         mu = pm.Deterministic(
             "mu",
@@ -151,12 +220,12 @@ def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initv
             + pm.math.dot(B_masked_data, beta_1),
         )
 
-        likelihood_fn(mu, Y_data, len(Y))
+        likelihood_fn(mu, Y_data, len(Y), priors)
 
     return gene_model
 
 
-def _build_profile_model(Y, B, n_bsplines, intercept_initval, likelihood="normal"):
+def _build_profile_model(Y, B, n_bsplines, intercept_initval, likelihood="normal", priors=None):
     """Build the condition-free P-spline GAM for a single gene.
 
     Same priors, spline basis and likelihood as `_build_gene_model`, minus
@@ -170,22 +239,23 @@ def _build_profile_model(Y, B, n_bsplines, intercept_initval, likelihood="normal
     if likelihood not in _LIKELIHOODS:
         raise ValueError(f"Unknown likelihood {likelihood!r}. Available: {sorted(_LIKELIHOODS)}")
     likelihood_fn = _LIKELIHOODS[likelihood]
+    priors = _resolve_priors(priors)
 
     with pm.Model() as gene_model:
         Y_data = pm.Data("Y_data", np.asarray(Y, dtype=float))
         B_data = pm.Data("B_data", B)
 
-        intercept = pm.Normal("intercept", mu=0, sigma=1, initval=intercept_initval)
-        beta = pm.Normal("beta", mu=0, sigma=1, shape=n_bsplines, initval=np.zeros(n_bsplines))
+        intercept = _draw_prior("intercept", priors["intercept"], initval=intercept_initval)
+        beta = _draw_prior("beta", priors["beta"], shape=n_bsplines, initval=np.zeros(n_bsplines))
 
         mu = pm.Deterministic("mu", intercept + pm.math.dot(B_data, beta))
 
-        likelihood_fn(mu, Y_data, len(Y))
+        likelihood_fn(mu, Y_data, len(Y), priors)
 
     return gene_model
 
 
-def setup_model(adata, likelihood="normal"):
+def setup_model(adata, likelihood="normal", priors=None):
     """Configure the per-gene GAM, given `adata` pre-processed by `diffsvg.pp.bin_obs`.
 
     This validates `adata`/`likelihood` and bundles them into a
@@ -200,6 +270,12 @@ def setup_model(adata, likelihood="normal"):
         (i.e. ``"binned" in adata.uns``).
     likelihood
         Observation model. Only ``"normal"`` (the default) is implemented.
+    priors
+        Overrides for any of `DEFAULT_PRIORS`, as ``{name: (distribution,
+        *params)}`` - e.g. ``{"beta": ("normal", 0.0, 2.0), "sigma":
+        ("exponential", 1.0)}``. Anything not named keeps its default, so
+        the models are unchanged unless asked. Validated here rather than
+        inside a worker, so a typo fails immediately.
 
     Returns
     -------
@@ -211,7 +287,7 @@ def setup_model(adata, likelihood="normal"):
         raise KeyError("adata.uns['binned'] not found - run `diffsvg.pp.bin_obs(adata, ...)` first.")
 
     binned = BinnedData(**adata.uns["binned"])
-    return DiffSVGModelSetup(binned=binned, likelihood=likelihood)
+    return DiffSVGModelSetup(binned=binned, likelihood=likelihood, priors=priors)
 
 
 # ============================================================
@@ -233,6 +309,7 @@ class _FitShared:
     condition_fit: np.ndarray
     n_bsplines: int
     likelihood: str
+    priors: dict
     bin_centers: np.ndarray
     B_pred: np.ndarray
     B_pred_masked_0: np.ndarray
@@ -248,6 +325,7 @@ class _ProfileShared:
     B: np.ndarray
     n_bsplines: int
     likelihood: str
+    priors: dict
     B_pred: np.ndarray
 
 
@@ -365,7 +443,14 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs):
     ``"cond{0,1}_ci_low"``, ``"cond{0,1}_ci_high"``).
     """
     model = _build_gene_model(
-        Y, shared.B, shared.B_masked, shared.condition_fit, shared.n_bsplines, intercept_initval, shared.likelihood
+        Y,
+        shared.B,
+        shared.B_masked,
+        shared.condition_fit,
+        shared.n_bsplines,
+        intercept_initval,
+        shared.likelihood,
+        shared.priors,
     )
     n_grid = shared.B_pred.shape[0]
 
@@ -456,7 +541,7 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs):
     differential statistic here - `one_vs_rest` derives those by comparing
     genes against each other. Returns ``(gene, diag_row, curve_row)``.
     """
-    model = _build_profile_model(Y, shared.B, shared.n_bsplines, intercept_initval, shared.likelihood)
+    model = _build_profile_model(Y, shared.B, shared.n_bsplines, intercept_initval, shared.likelihood, shared.priors)
     n_grid = shared.B_pred.shape[0]
 
     with model, _quiet_pymc():
@@ -621,6 +706,7 @@ def fit_model(
         condition_fit=condition_fit,
         n_bsplines=binned.n_bsplines,
         likelihood=model_setup.likelihood,
+        priors=model_setup.priors,
         bin_centers=binned.bin_centers,
         B_pred=binned.B_pred,
         B_pred_masked_0=binned.B_pred_masked_0,
@@ -749,6 +835,7 @@ def fit_profiles(
         B=B,
         n_bsplines=binned.n_bsplines,
         likelihood=model_setup.likelihood,
+        priors=model_setup.priors,
         B_pred=binned.B_pred,
     )
 
