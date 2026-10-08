@@ -314,7 +314,7 @@ def plot_volcano(
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.set_xlabel(r"$\int f_0 - f_1$", fontsize=12)
+    ax.set_xlabel(r"$\Delta_{f_0 - f_1}$", fontsize=12)
     ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=12)
     ax.tick_params(labelsize=10)
 
