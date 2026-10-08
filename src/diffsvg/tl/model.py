@@ -180,7 +180,7 @@ class DiffSVGModelSetup:
 
     binned: BinnedData
     likelihood: str
-    priors: dict = None
+    priors: dict | None = None
 
     def __post_init__(self):
         self.priors = _resolve_priors(self.priors)
