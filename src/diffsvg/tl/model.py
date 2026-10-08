@@ -64,10 +64,11 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 from joblib import Parallel, delayed
+from scipy.sparse import issparse
 from scipy.stats import chi2, gamma
 from tqdm.auto import tqdm
 
-from diffsvg.pp.utils import BinnedData
+from diffsvg.pp.utils import BinnedData, build_spline_basis, compute_interior_knots
 
 # ============================================================
 # 1) Likelihoods
@@ -248,6 +249,51 @@ class _ProfileShared:
     n_bsplines: int
     likelihood: str
     B_pred: np.ndarray
+
+
+def _fit_inputs(adata, binned, use_binned):
+    """The targets and design matrices to fit on: the binned aggregates, or one row per cell.
+
+    ``use_binned=True`` hands back exactly what `diffsvg.pp.bin_obs`
+    precomputed. ``use_binned=False`` rebuilds the same quantities at cell
+    resolution - the *same* knots, degree and condition encoding, so the two
+    stay comparable - and reads `Y` straight from `adata` rather than
+    duplicating the expression matrix into ``adata.uns``.
+
+    Returns ``(B, B_masked, condition_fit, Y, intercept_initvals)``.
+    """
+    if use_binned:
+        return binned.B, binned.B_masked, binned.condition_fit, binned.Y, binned.intercept_initvals
+
+    design = adata.obsm[binned.design_matrix]
+    anchor_vals = design[binned.anchor].to_numpy(dtype=float)
+    interior_knots = compute_interior_knots(binned.n_bsplines, degree=binned.degree)[1:-1]
+    B, _ = build_spline_basis(anchor_vals, interior_knots, degree=binned.degree)
+
+    condition_fit, B_masked = None, None
+    if binned.has_condition:
+        code_map = {label: float(code) for code, label in binned.condition_categories.items()}
+        condition_fit = design[binned.condition].map(code_map).to_numpy(dtype=float)
+        if np.isnan(condition_fit).any():
+            raise ValueError(
+                f"`condition` column {binned.condition!r} holds values that were not seen when binning "
+                f"(expected {sorted(code_map)}) - re-run `diffsvg.pp.bin_obs`."
+            )
+        B_masked = B * condition_fit[:, None]
+
+    sub = adata[:, binned.genes]
+    X = sub.layers[binned.layer] if binned.layer is not None else sub.X
+    X = X.toarray() if issparse(X) else np.asarray(X)
+    X = np.asarray(X, dtype=float)
+
+    Y = {gene: X[:, i] for i, gene in enumerate(binned.genes)}
+    # Same intent as the binned initval (mean expression at the anchor
+    # origin), but no cell sits exactly at 0, so the first bin stands in.
+    first_bin = np.asarray(binned.bin_assignment) == 0
+    intercept_initvals = {
+        gene: float(y[first_bin].mean()) if first_bin.any() else float(y.mean()) for gene, y in Y.items()
+    }
+    return B, B_masked, condition_fit, Y, intercept_initvals
 
 
 @contextlib.contextmanager
@@ -476,6 +522,7 @@ def fit_model(
     n_workers=1,
     progressbar=True,
     inplace=True,
+    use_binned=True,
     stats_key="dsvg_stats",
     preds_key="dsvg_preds",
     curves_key="dsvg_curves",
@@ -503,6 +550,15 @@ def fit_model(
         genes are never split across workers or re-synced, so there is
         nothing to race. `n_workers=1` runs sequentially in-process (no
         extra pickling at all).
+    use_binned
+        Fit on the per-bin averages from `diffsvg.pp.bin_obs` (default), or
+        on the raw per-cell values when `False`. Raw keeps every
+        observation instead of collapsing each window to its mean, at the
+        cost of a far larger design matrix - with spatial data that is
+        mostly zero counts, which is what the binning is there to avoid,
+        this is typically much slower per gene. Knots, degree and the
+        condition encoding are identical either way, so the two are
+        directly comparable.
     progressbar
         Show a `tqdm` progress bar over completed genes. Per-worker MCMC
         progress bars are always disabled (they would interleave garbage
@@ -558,10 +614,11 @@ def fit_model(
             "Re-run `diffsvg.pp.bin_obs` with one, or use `diffsvg.tl.fit_profiles` + "
             "`diffsvg.tl.one_vs_rest` for the condition-free one-vs-rest test."
         )
+    B, B_masked, condition_fit, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     shared = _FitShared(
-        B=binned.B,
-        B_masked=binned.B_masked,
-        condition_fit=binned.condition_fit,
+        B=B,
+        B_masked=B_masked,
+        condition_fit=condition_fit,
         n_bsplines=binned.n_bsplines,
         likelihood=model_setup.likelihood,
         bin_centers=binned.bin_centers,
@@ -574,7 +631,7 @@ def fit_model(
 
     n_jobs = 1 if n_workers is None else n_workers
     results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
-        delayed(_fit_and_predict_gene)(gene, binned.Y[gene], binned.intercept_initvals[gene], shared, sample_defaults)
+        delayed(_fit_and_predict_gene)(gene, Y[gene], intercept_initvals[gene], shared, sample_defaults)
         for gene in binned.genes
     )
     if progressbar:
@@ -632,6 +689,7 @@ def fit_profiles(
     n_workers=1,
     progressbar=True,
     inplace=True,
+    use_binned=True,
     profiles_key="dsvg_profiles",
     sample_kwargs=None,
     **pymc_kwargs,
@@ -657,7 +715,7 @@ def fit_profiles(
         when `inplace` is `True`.
     model_setup
         Output of `setup_model`.
-    n_workers, progressbar, sample_kwargs, **pymc_kwargs
+    n_workers, progressbar, use_binned, sample_kwargs, **pymc_kwargs
         As in `fit_model`.
     inplace
         If `True` (default), write the results to `adata.varm` and return
@@ -686,8 +744,9 @@ def fit_profiles(
     sample_defaults.update(pymc_kwargs)
 
     binned = model_setup.binned
+    B, _, _, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     shared = _ProfileShared(
-        B=binned.B,
+        B=B,
         n_bsplines=binned.n_bsplines,
         likelihood=model_setup.likelihood,
         B_pred=binned.B_pred,
@@ -695,9 +754,7 @@ def fit_profiles(
 
     n_jobs = 1 if n_workers is None else n_workers
     results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
-        delayed(_fit_and_predict_profile)(
-            gene, binned.Y[gene], binned.intercept_initvals[gene], shared, sample_defaults
-        )
+        delayed(_fit_and_predict_profile)(gene, Y[gene], intercept_initvals[gene], shared, sample_defaults)
         for gene in binned.genes
     )
     if progressbar:

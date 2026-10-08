@@ -201,6 +201,9 @@ class BinnedData:
         Per-cell (i.e. per ``adata.obs_names``) index into `bin_centers` -
         which bin each cell was assigned to, by nearest `anchor` value. Also
         written to ``adata.obs[f"{anchor}_bin"]`` by `bin_obs`.
+    design_matrix, layer
+        Where the unbinned data lives, so the fitters can rebuild the
+        per-cell design matrices for ``use_binned=False``.
     B_pred, B_pred_masked_0, B_pred_masked_1, condition_pred_0, condition_pred_1
         Precomputed design matrices for the prediction grid.
     """
@@ -209,21 +212,26 @@ class BinnedData:
     Y: dict
     intercept_initvals: dict
     anchor: str
-    condition: str
-    condition_categories: dict
+    condition: str | None
+    condition_categories: dict | None
     n_bsplines: int
     degree: int
     n_bins: int
     B: np.ndarray
-    B_masked: np.ndarray
-    condition_fit: np.ndarray
+    B_masked: np.ndarray | None
+    condition_fit: np.ndarray | None
     bin_centers: np.ndarray
     bin_assignment: np.ndarray
     B_pred: np.ndarray
-    B_pred_masked_0: np.ndarray
-    B_pred_masked_1: np.ndarray
-    condition_pred_0: np.ndarray
-    condition_pred_1: np.ndarray
+    B_pred_masked_0: np.ndarray | None
+    B_pred_masked_1: np.ndarray | None
+    condition_pred_0: np.ndarray | None
+    condition_pred_1: np.ndarray | None
+    # Defaulted so that a `binned` dict written before these existed still
+    # reconstructs; they only record where the unbinned data came from, for
+    # `diffsvg.tl.fit_model(..., use_binned=False)`.
+    design_matrix: str = "design_matrix"
+    layer: str | None = None
 
     @property
     def has_condition(self):
@@ -384,6 +392,8 @@ def bin_obs(
         condition_fit=condition_fit,
         bin_centers=bin_centers,
         bin_assignment=bin_assignment,
+        design_matrix=design_matrix,
+        layer=layer,
         B_pred=B_pred,
         B_pred_masked_0=B_pred_masked_0,
         B_pred_masked_1=B_pred_masked_1,
