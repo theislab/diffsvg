@@ -325,6 +325,25 @@ def plot_volcano(
     return ax
 
 
+def _draw_prediction_curve(adata, gene, ax, curves_key, condition_labels, colors):
+    """Draw one gene's two condition curves (mean + credible band) into `ax`."""
+    for cat in (0, 1):
+        curves = adata.varm[f"{curves_key}_cond{cat}_mean"]
+        mean = curves.loc[gene]
+        lower = adata.varm[f"{curves_key}_cond{cat}_ci_low"].loc[gene]
+        upper = adata.varm[f"{curves_key}_cond{cat}_ci_high"].loc[gene]
+        # Taken from the columns, not from `mean.index`, so the bin grid is
+        # read off the table itself rather than depending on what `.loc`
+        # happened to return.
+        x = curves.columns.to_numpy(dtype=float)
+
+        ax.plot(x, mean.to_numpy(), color=colors[cat], lw=2, label=condition_labels[str(cat)])
+        ax.fill_between(x, lower.to_numpy(), upper.to_numpy(), color=colors[cat], alpha=0.2)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
 def plot_prediction_curve(
     adata,
     gene,
@@ -332,20 +351,22 @@ def plot_prediction_curve(
     condition_labels=None,
     colors=None,
     ax=None,
+    ncols=4,
     figsize=(6, 5),
     save_path=None,
 ):
-    """Plot the predicted expression curve (posterior mean +/- credible band) for `gene`, for both conditions.
+    """Plot the predicted expression curve (posterior mean +/- credible band) per gene, for both conditions.
 
     Reads the six ``adata.varm[f"{curves_key}_cond{0,1}_{mean,ci_low,ci_high}"]``
-    tables written by `diffsvg.tl.fit_model`.
+    tables written by `diffsvg.tl.fit_model`. Several genes are drawn as a
+    grid of panels, one gene each.
 
     Parameters
     ----------
     adata
         Annotated data matrix that `diffsvg.tl.fit_model` wrote into.
     gene
-        Gene to plot (must be in ``adata.var_names``).
+        A gene name, or a list of them (all must be in ``adata.var_names``).
     curves_key
         Prefix used by `diffsvg.tl.fit_model` for the per-condition curve
         `adata.varm` entries.
@@ -356,45 +377,77 @@ def plot_prediction_curve(
     colors
         ``{0: color, 1: color}`` for the two curves.
     ax
-        Existing axes to draw into; a new figure is created if omitted.
+        Existing axes to draw into; for several genes, a sequence of at
+        least that many axes. A new figure is created if omitted.
+    ncols
+        Panels per row when several genes are given. The grid is narrowed
+        when there are fewer genes than this, so three genes give one row of
+        three rather than a row of four with a gap.
     figsize
-        Passed to `plt.subplots` when `ax` is omitted.
+        Size of a *single* panel. The figure is scaled by the grid shape, so
+        one gene still gets exactly `figsize`.
     save_path
         If given, save the figure here (``dpi=300, bbox_inches="tight"``).
 
     Returns
     -------
-    matplotlib.axes.Axes
+    A single `matplotlib.axes.Axes` when one gene is given, otherwise a list
+    of them, one per gene in the order passed.
     """
-    if ax is None:
-        _, ax = plt.subplots(figsize=figsize)
+    single = isinstance(gene, str)
+    genes = [gene] if single else list(gene)
+    if not genes:
+        raise ValueError("`gene` is empty - pass at least one gene name.")
+    missing = [g for g in genes if g not in adata.var_names]
+    if missing:
+        raise KeyError(f"genes not found in adata.var_names: {missing}")
+    # One gene is one panel however it was passed, so a one-element list
+    # behaves (and returns) exactly like the bare string.
+    single = len(genes) == 1
 
     if condition_labels is None:
         condition_labels = adata.uns.get(f"{curves_key}_condition_categories", {"0": "condition 0", "1": "condition 1"})
     if colors is None:
         colors = {0: "steelblue", 1: "darkorange"}
 
-    for cat in (0, 1):
-        mean = adata.varm[f"{curves_key}_cond{cat}_mean"].loc[gene]
-        lower = adata.varm[f"{curves_key}_cond{cat}_ci_low"].loc[gene]
-        upper = adata.varm[f"{curves_key}_cond{cat}_ci_high"].loc[gene]
-        x = mean.index.to_numpy(dtype=float)
+    if ax is None:
+        ncols = max(1, min(ncols, len(genes)))
+        nrows = (len(genes) + ncols - 1) // ncols
+        _, grid = plt.subplots(nrows, ncols, figsize=(ncols * figsize[0], nrows * figsize[1]), squeeze=False)
+        grid = grid.ravel()
+        for spare in grid[len(genes) :]:  # trailing cells of a part-filled last row
+            spare.set_visible(False)
+        axes = list(grid[: len(genes)])
+    elif isinstance(ax, plt.Axes):
+        if not single:
+            raise ValueError(
+                f"`ax` is a single Axes but {len(genes)} genes were given - "
+                "pass a sequence of at least that many axes, or omit `ax` to get a grid."
+            )
+        axes = [ax]
+    else:
+        axes = list(ax)
+        if len(axes) < len(genes):
+            raise ValueError(f"`ax` holds {len(axes)} axes but {len(genes)} genes were given.")
+        axes = axes[: len(genes)]
 
-        ax.plot(x, mean.to_numpy(), color=colors[cat], lw=2, label=condition_labels[str(cat)])
-        ax.fill_between(x, lower.to_numpy(), upper.to_numpy(), color=colors[cat], alpha=0.2)
+    for g, a in zip(genes, axes, strict=True):
+        _draw_prediction_curve(adata, g, a, curves_key, condition_labels, colors)
+        a.set_xlabel("Normalized distance", fontsize=14)
+        if single:
+            a.set_ylabel(f"smoothed {g} expression", fontsize=14)
+        else:
+            a.set_title(g, fontsize=14)
+            a.set_ylabel("smoothed expression", fontsize=12)
+    # One shared legend: repeating it in every panel is just noise.
+    axes[0].legend(frameon=False, fontsize=12)
 
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.set_xlabel("Normalized distance", fontsize=14)
-    ax.set_ylabel(f"smoothed {gene} expression", fontsize=14)
-    ax.legend(frameon=False, fontsize=12)
-
-    fig = ax.get_figure()
+    fig = axes[0].get_figure()
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
-    return ax
+    return axes[0] if single else axes
 
 
 def plot_pvalue_histogram(
