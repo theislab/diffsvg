@@ -155,6 +155,35 @@ def _build_gene_model(Y, B, B_masked, condition_arr, n_bsplines, intercept_initv
     return gene_model
 
 
+def _build_profile_model(Y, B, n_bsplines, intercept_initval, likelihood="normal"):
+    """Build the condition-free P-spline GAM for a single gene.
+
+    Same priors, spline basis and likelihood as `_build_gene_model`, minus
+    the `condition` covariate and its interaction with the spline: with no
+    conditions there is nothing for them to encode, and the Wald test on the
+    interaction coefficient does not apply either (see `one_vs_rest`, which
+    ranks on the curve distance instead). Kept as its own builder rather
+    than branching inside `_build_gene_model`, so each model reads as one
+    straight-line definition.
+    """
+    if likelihood not in _LIKELIHOODS:
+        raise ValueError(f"Unknown likelihood {likelihood!r}. Available: {sorted(_LIKELIHOODS)}")
+    likelihood_fn = _LIKELIHOODS[likelihood]
+
+    with pm.Model() as gene_model:
+        Y_data = pm.Data("Y_data", np.asarray(Y, dtype=float))
+        B_data = pm.Data("B_data", B)
+
+        intercept = pm.Normal("intercept", mu=0, sigma=1, initval=intercept_initval)
+        beta = pm.Normal("beta", mu=0, sigma=1, shape=n_bsplines, initval=np.zeros(n_bsplines))
+
+        mu = pm.Deterministic("mu", intercept + pm.math.dot(B_data, beta))
+
+        likelihood_fn(mu, Y_data, len(Y))
+
+    return gene_model
+
+
 def setup_model(adata, likelihood="normal"):
     """Configure the per-gene GAM, given `adata` pre-processed by `diffsvg.pp.bin_obs`.
 
@@ -209,6 +238,16 @@ class _FitShared:
     B_pred_masked_1: np.ndarray
     condition_pred_0: np.ndarray
     condition_pred_1: np.ndarray
+
+
+@dataclass
+class _ProfileShared:
+    """`_FitShared`'s counterpart for the condition-free model - same contract, fewer arrays."""
+
+    B: np.ndarray
+    n_bsplines: int
+    likelihood: str
+    B_pred: np.ndarray
 
 
 @contextlib.contextmanager
@@ -363,6 +402,39 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs):
     return gene, stats_row, curve_row
 
 
+def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs):
+    """Build + sample one gene's condition-free model, then its single posterior predictive curve.
+
+    The `_fit_and_predict_gene` counterpart for data without conditions: one
+    curve per gene instead of one per condition, so there is no delta and no
+    differential statistic here - `one_vs_rest` derives those by comparing
+    genes against each other. Returns ``(gene, diag_row, curve_row)``.
+    """
+    model = _build_profile_model(Y, shared.B, shared.n_bsplines, intercept_initval, shared.likelihood)
+    n_grid = shared.B_pred.shape[0]
+
+    with model, _quiet_pymc():
+        idata = pm.sample(**sample_kwargs)
+
+        pm.set_data({"B_data": shared.B_pred, "Y_data": np.zeros(n_grid)})
+        pred = pm.sample_posterior_predictive(idata, var_names=["D"], extend_inferencedata=False, progressbar=False)
+
+        draws = pred.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
+        mean = draws.mean(axis=0)
+        ci_low, ci_high = np.quantile(draws, [0.03, 0.97], axis=0)
+
+        diag_vars = ["intercept", "beta", "sigma"]
+        n_divergent = int(idata.sample_stats["diverging"].sum()) if "diverging" in idata.sample_stats else 0
+        rhat_ds = az.rhat(idata, var_names=diag_vars)
+        ess_ds = az.ess(idata, var_names=diag_vars, method="bulk")
+        rhat_max = float(max(np.asarray(rhat_ds[v]).max() for v in rhat_ds.data_vars))
+        ess_bulk_min = float(min(np.asarray(ess_ds[v]).min() for v in ess_ds.data_vars))
+
+    diag_row = {"gene": gene, "n_divergent": n_divergent, "rhat_max": rhat_max, "ess_bulk_min": ess_bulk_min}
+    curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high}
+    return gene, diag_row, curve_row
+
+
 def _compute_null_pvalues(T_values, null_quantile=0.9):
     """Empirical + Gamma-null p-values for an array of functional Wald/`T` statistics.
 
@@ -480,6 +552,12 @@ def fit_model(
     sample_defaults.update(pymc_kwargs)
 
     binned = model_setup.binned
+    if not binned.has_condition:
+        raise ValueError(
+            "adata.uns['binned'] was built without a `condition`, so there are no two curves to compare. "
+            "Re-run `diffsvg.pp.bin_obs` with one, or use `diffsvg.tl.fit_profiles` + "
+            "`diffsvg.tl.one_vs_rest` for the condition-free one-vs-rest test."
+        )
     shared = _FitShared(
         B=binned.B,
         B_masked=binned.B_masked,
@@ -538,6 +616,218 @@ def fit_model(
         adata.varm[f"{curves_key}_{suffix}"] = df.reindex(adata.var_names)
     adata.uns[f"{curves_key}_condition_categories"] = binned.condition_categories
     return None
+
+
+# ============================================================
+# 3b) Condition-free profiles + the one-vs-rest test
+# ============================================================
+
+
+_PROFILE_SUFFIXES = ("mean", "ci_low", "ci_high")
+
+
+def fit_profiles(
+    adata,
+    model_setup,
+    n_workers=1,
+    progressbar=True,
+    inplace=True,
+    profiles_key="dsvg_profiles",
+    sample_kwargs=None,
+    **pymc_kwargs,
+):
+    """Fit the condition-free model for every gene, giving one expression profile per gene.
+
+    The counterpart to `fit_model` for data binned without a `condition`
+    (`diffsvg.pp.bin_obs(..., condition=None)`): it drops the condition
+    covariate and its spline interaction, so each gene gets a single curve
+    rather than one per condition. No differential statistic is computed
+    here - `one_vs_rest` produces that by comparing genes against each
+    other.
+
+    Also usable on data that *does* have conditions, in which case both
+    conditions' bins feed one pooled curve per gene. That is an alternative
+    to what `one_vs_rest` does by default there (averaging the two fitted
+    condition curves), and the two need not agree exactly.
+
+    Parameters
+    ----------
+    adata
+        The `AnnData` `model_setup.binned` was built from; the write target
+        when `inplace` is `True`.
+    model_setup
+        Output of `setup_model`.
+    n_workers, progressbar, sample_kwargs, **pymc_kwargs
+        As in `fit_model`.
+    inplace
+        If `True` (default), write the results to `adata.varm` and return
+        `None`; otherwise return ``(profile_dfs, diagnostics_df)``.
+    profiles_key
+        Prefix for three `adata.varm` tables (`n_genes x (n_bins + 1)`), one
+        per ``{"mean", "ci_low", "ci_high"}``, plus a
+        ``f"{profiles_key}_diagnostics"`` table of per-gene sampler
+        diagnostics.
+
+    Returns
+    -------
+    None or tuple[dict[str, pandas.DataFrame], pandas.DataFrame]
+    """
+    sample_defaults = {
+        "nuts_sampler": "nutpie",
+        "draws": 1000,
+        "tune": 1000,
+        "chains": 4,
+        "random_seed": 42,
+        "compute_convergence_checks": False,
+        "init": "adapt_diag",
+        "progressbar": False,
+    }
+    sample_defaults.update(sample_kwargs or {})
+    sample_defaults.update(pymc_kwargs)
+
+    binned = model_setup.binned
+    shared = _ProfileShared(
+        B=binned.B,
+        n_bsplines=binned.n_bsplines,
+        likelihood=model_setup.likelihood,
+        B_pred=binned.B_pred,
+    )
+
+    n_jobs = 1 if n_workers is None else n_workers
+    results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
+        delayed(_fit_and_predict_profile)(
+            gene, binned.Y[gene], binned.intercept_initvals[gene], shared, sample_defaults
+        )
+        for gene in binned.genes
+    )
+    if progressbar:
+        results = tqdm(results, total=len(binned.genes), desc="Fitting DiffSVG profiles")
+
+    diag_rows = []
+    curve_rows = {}
+    for gene, diag_row, curve_row in results:
+        diag_rows.append(diag_row)
+        curve_rows[gene] = curve_row
+
+    diagnostics_df = pd.DataFrame(diag_rows).set_index("gene").reindex(binned.genes)
+    bin_cols = [str(round(float(c), 4)) for c in binned.bin_centers]
+    profile_dfs = {
+        suffix: pd.DataFrame.from_dict(
+            {gene: row[suffix] for gene, row in curve_rows.items()}, orient="index", columns=bin_cols
+        ).reindex(binned.genes)
+        for suffix in _PROFILE_SUFFIXES
+    }
+
+    if not inplace:
+        return profile_dfs, diagnostics_df
+
+    for suffix, df in profile_dfs.items():
+        adata.varm[f"{profiles_key}_{suffix}"] = df.reindex(adata.var_names)
+    adata.varm[f"{profiles_key}_diagnostics"] = diagnostics_df.reindex(adata.var_names)
+    return None
+
+
+def _gene_profiles(adata, curves_key, profiles_key):
+    """One curve per gene, as a (genes x bins) frame, plus a note on where it came from.
+
+    Prefers an explicit `fit_profiles` result; otherwise averages the two
+    per-condition curves from `fit_model`, which is what collapses a
+    two-condition fit into a single profile per gene.
+    """
+    if f"{profiles_key}_mean" in adata.varm:
+        return adata.varm[f"{profiles_key}_mean"], "profiles"
+    if f"{curves_key}_cond0_mean" in adata.varm:
+        cond0 = adata.varm[f"{curves_key}_cond0_mean"]
+        cond1 = adata.varm[f"{curves_key}_cond1_mean"]
+        return (cond0 + cond1) / 2.0, "condition-average"
+    raise KeyError(
+        f"neither adata.varm[{profiles_key + '_mean'!r}] nor adata.varm[{curves_key + '_cond0_mean'!r}] found - "
+        "run `diffsvg.tl.fit_profiles` (no conditions) or `diffsvg.tl.fit_model` (with conditions) first."
+    )
+
+
+def one_vs_rest(
+    adata,
+    gene,
+    curves_key="dsvg_curves",
+    profiles_key="dsvg_profiles",
+    null_quantile=0.9,
+    inplace=False,
+    key_added=None,
+):
+    """Compare one gene's expression profile against every other gene's.
+
+    Each gene is reduced to a single curve along `anchor` (see
+    `_gene_profiles`), and the probe gene is then tested against each of the
+    remaining genes individually. The per-comparison statistics mirror
+    `fit_model`'s: `T` is the functional L2 distance between the two curves
+    and drives the same empirical/Gamma null p-values, computed here over
+    the population of "rest" genes rather than over conditions.
+
+    No Wald test is reported: it tests the interaction coefficient, which
+    the condition-free model does not have, and which is not what is being
+    compared here anyway.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix that `fit_profiles` or `fit_model` wrote into.
+    gene
+        The probe gene, i.e. the "one" in one-vs-rest.
+    curves_key, profiles_key
+        `adata.varm` prefixes written by `fit_model` / `fit_profiles`. An
+        explicit `fit_profiles` result wins when both are present.
+    null_quantile
+        Passed to `_compute_null_pvalues`.
+    inplace
+        If `True`, also write the table to ``adata.varm[key_added]``
+        (reindexed to ``adata.var_names``, so the probe gene's own row is
+        `NaN`). The table is returned either way.
+    key_added
+        `adata.varm` key used when `inplace`; defaults to
+        ``f"dsvg_ovr_{gene}"``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by the "rest" genes, with ``delta`` (the signed area between
+        the probe curve and that gene's, negative when the probe sits below
+        it), ``T``, and the empirical/Gamma p-values with their BH-adjusted
+        counterparts.
+    """
+    profiles, source = _gene_profiles(adata, curves_key, profiles_key)
+    if gene not in profiles.index:
+        raise KeyError(f"{gene!r} not found in adata.var_names")
+
+    profiles = profiles.dropna(how="all")
+    if gene not in profiles.index:
+        raise KeyError(f"{gene!r} has no fitted curve - it was not part of the fitted gene set.")
+    rest = profiles.drop(index=gene)
+    if rest.empty:
+        raise ValueError("need at least two genes with fitted curves for a one-vs-rest comparison.")
+
+    bin_centers = profiles.columns.to_numpy(dtype=float)
+    # probe minus rest, so a downregulated probe gives a negative delta.
+    delta = profiles.loc[gene].to_numpy()[None, :] - rest.to_numpy()
+
+    result = pd.DataFrame(
+        {
+            "delta": np.trapezoid(delta, x=bin_centers, axis=1),
+            "T": (delta**2).mean(axis=1),
+        },
+        index=rest.index,
+    )
+    result["empirical_pval"], result["gamma_pval"] = _compute_null_pvalues(
+        result["T"].to_numpy(), null_quantile=null_quantile
+    )
+    result["empirical_pval_adj"] = _benjamini_hochberg(result["empirical_pval"].to_numpy())
+    result["gamma_pval_adj"] = _benjamini_hochberg(result["gamma_pval"].to_numpy())
+    result.attrs["probe_gene"] = gene
+    result.attrs["profile_source"] = source
+
+    if inplace:
+        adata.varm[key_added or f"dsvg_ovr_{gene}"] = result.reindex(adata.var_names)
+    return result
 
 
 # ============================================================

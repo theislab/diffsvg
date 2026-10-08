@@ -41,7 +41,8 @@ def bin_counts(
     category
         Column in `design_matrix` used to stratify the binning (e.g. a
         condition indicator). Also used as the column name for the category
-        value in the returned per-gene data frames.
+        value in the returned per-gene data frames. `None` bins along
+        `anchor` only, as a single group.
     design_matrix
         ``adata.obsm`` key of a data frame aligned to ``adata.obs_names``
         holding at least `anchor` and `category`. Defaults to
@@ -74,7 +75,9 @@ def bin_counts(
     X = np.asarray(X, dtype=float)  # (n_obs, n_genes)
 
     value = design_matrix[anchor].values
-    cat = design_matrix[category].values
+    # `category=None` bins along `anchor` alone, as one group - used for the
+    # condition-free models behind `diffsvg.tl.one_vs_rest`.
+    cat = np.zeros(len(value)) if category is None else design_matrix[category].values
 
     bin_centers = np.linspace(0, 1, n_bins + 1)
     categories = np.unique(cat)
@@ -94,7 +97,8 @@ def bin_counts(
             meta_rows.append((c, center, lower, upper, n_obs))
             avg_rows.append(avg)
 
-    meta = pd.DataFrame(meta_rows, columns=[category, anchor, "window_start", "window_end", "n_obs"])
+    meta_cols = ["_group" if category is None else category, anchor, "window_start", "window_end", "n_obs"]
+    meta = pd.DataFrame(meta_rows, columns=meta_cols)
     avg = np.vstack(avg_rows)  # (n_meta_rows, n_genes)
 
     if drop_empty_bins:
@@ -177,7 +181,9 @@ class BinnedData:
         binned expression at ``anchor == 0``).
     anchor, condition
         Column names in ``adata.obsm["design_matrix"]`` the data was binned
-        on.
+        on. `condition` is `None` when binned without one, in which case
+        every condition-dependent field below is `None` too and only the
+        condition-free models (see `diffsvg.tl.fit_profiles`) can be fit.
     condition_categories
         Mapping ``{"0": <original label>, "1": <original label>}`` recording
         how `condition` was encoded to ``0.0``/``1.0`` (string keys so this
@@ -219,6 +225,11 @@ class BinnedData:
     condition_pred_0: np.ndarray
     condition_pred_1: np.ndarray
 
+    @property
+    def has_condition(self):
+        """Whether this was binned with a `condition`, i.e. whether the two-condition models can be fit."""
+        return self.condition is not None
+
 
 def bin_obs(
     adata,
@@ -252,7 +263,10 @@ def bin_obs(
         is built on.
     condition
         Column in ``adata.obsm["design_matrix"]`` giving the two groups to
-        compare (e.g. control vs. treatment).
+        compare (e.g. control vs. treatment). Pass `None` for data without
+        conditions: binning then runs along `anchor` only, and the result
+        supports the condition-free models used by
+        `diffsvg.tl.fit_profiles`/`diffsvg.tl.one_vs_rest`.
     genes
         Genes to model. Defaults to all of ``adata.var_names``.
     n_bsplines
@@ -287,7 +301,7 @@ def bin_obs(
     """
     design_matrix_df = adata.obsm[design_matrix]
     for col in (anchor, condition):
-        if col not in design_matrix_df.columns:
+        if col is not None and col not in design_matrix_df.columns:
             raise KeyError(f"{col!r} not found in adata.obsm[{design_matrix!r}]")
 
     genes = list(adata.var_names) if genes is None else list(genes)
@@ -295,9 +309,11 @@ def bin_obs(
     if missing:
         raise KeyError(f"Genes not found in adata.var_names: {sorted(missing)}")
 
-    levels = sorted(pd.unique(design_matrix_df[condition]), key=str)
-    if len(levels) != 2:
-        raise ValueError(f"`condition` column {condition!r} must have exactly two levels, found: {levels}")
+    levels = None
+    if condition is not None:
+        levels = sorted(pd.unique(design_matrix_df[condition]), key=str)
+        if len(levels) != 2:
+            raise ValueError(f"`condition` column {condition!r} must have exactly two levels, found: {levels}")
 
     binned = bin_counts(
         adata,
@@ -312,9 +328,10 @@ def bin_obs(
 
     # Encode `condition` to 0.0/1.0 so it can be used directly as a numeric
     # covariate; keep the original labels around for interpretability.
-    code_map = {levels[0]: 0.0, levels[1]: 1.0}
-    for gene in genes:
-        binned[gene][condition] = binned[gene][condition].map(code_map).astype(float)
+    if condition is not None:
+        code_map = {levels[0]: 0.0, levels[1]: 1.0}
+        for gene in genes:
+            binned[gene][condition] = binned[gene][condition].map(code_map).astype(float)
 
     knots_full = compute_interior_knots(n_bsplines, degree=degree)
     interior_knots = knots_full[1:-1]
@@ -324,9 +341,9 @@ def bin_obs(
     # `Y` (binned expression) differs per gene.
     template = binned[genes[0]]
     anchor_vals = template[anchor].to_numpy()
-    condition_fit = template[condition].to_numpy(dtype=float)
+    condition_fit = None if condition is None else template[condition].to_numpy(dtype=float)
     B, design_info = build_spline_basis(anchor_vals, interior_knots, degree=degree)
-    B_masked = B * condition_fit[:, None]
+    B_masked = None if condition is None else B * condition_fit[:, None]
     zero_mask = anchor_vals == 0.0
 
     Y = {}
@@ -341,10 +358,10 @@ def bin_obs(
     # condition levels.
     bin_centers = np.linspace(0, 1, n_bins + 1)
     B_pred = np.asarray(patsy.build_design_matrices([design_info], {"x": bin_centers})[0])
-    condition_pred_0 = np.zeros(n_bins + 1)
-    condition_pred_1 = np.ones(n_bins + 1)
-    B_pred_masked_0 = B_pred * condition_pred_0[:, None]
-    B_pred_masked_1 = B_pred * condition_pred_1[:, None]
+    condition_pred_0 = None if condition is None else np.zeros(n_bins + 1)
+    condition_pred_1 = None if condition is None else np.ones(n_bins + 1)
+    B_pred_masked_0 = None if condition is None else B_pred * condition_pred_0[:, None]
+    B_pred_masked_1 = None if condition is None else B_pred * condition_pred_1[:, None]
 
     # Every cell (not just those in `genes`) gets assigned to its nearest
     # bin center - `bin_centers` is an evenly spaced grid, so this is just
@@ -358,7 +375,7 @@ def bin_obs(
         intercept_initvals=intercept_initvals,
         anchor=anchor,
         condition=condition,
-        condition_categories={"0": levels[0], "1": levels[1]},
+        condition_categories=None if condition is None else {"0": levels[0], "1": levels[1]},
         n_bsplines=n_bsplines,
         degree=degree,
         n_bins=n_bins,
