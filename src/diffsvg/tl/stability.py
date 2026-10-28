@@ -130,6 +130,8 @@ def check_stability(
     random_state=0,
     design_matrix="design_matrix",
     sample_kwargs=None,
+    test="wald",
+    tau=0.1,
 ):
     """Re-rank genes under every combination in `grid` and measure how much the ranking moves.
 
@@ -161,8 +163,9 @@ def check_stability(
     rank_by, higher_is_stronger
         Column of `fit_model`'s statistics table to rank on, and whether
         larger means stronger. Rank on a statistic rather than a p-value:
-        the p-values are computed against the panel, so subsampling shifts
-        them and they do not compare across runs.
+        the Wald test's p-values are computed against the panel, so
+        subsampling shifts them and they do not compare across runs. With
+        ``test="parallel"``, rank on e.g. ``"parallel_stat"``.
     top_k
         Size of the "top genes" set used for the overlap metric.
     n_seeds
@@ -175,6 +178,8 @@ def check_stability(
         suppressed in favour of one bar over runs.
     random_state
         Seed for the gene subsample.
+    test, tau
+        Which condition test every run uses, as in `fit_model`.
 
     Returns
     -------
@@ -246,6 +251,8 @@ def check_stability(
                 inplace=False,
                 use_binned=config["use_binned"],
                 sample_kwargs={**sample_kwargs, "random_seed": seed},
+                test=test,
+                tau=tau,
             )
             columns[label] = stats_df[rank_by]
             if iterator is not None:
