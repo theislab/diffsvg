@@ -35,7 +35,9 @@ def _heatmap(result, matrix, label, floor, ax, cmap, annotate, title):
         # letting the colorbar steal width from the heatmap: the dendrogram
         # only lines up with the columns if both share one grid column.
         rows = [1, 4] if link is not None else [0.001, 4]
-        grid = ax.get_subplotspec().subgridspec(2, 2, height_ratios=rows, width_ratios=[20, 1], hspace=0.04, wspace=0.04)
+        grid = ax.get_subplotspec().subgridspec(
+            2, 2, height_ratios=rows, width_ratios=[20, 1], hspace=0.04, wspace=0.04
+        )
         ax.remove()
         if link is not None:
             tree_ax = fig.add_subplot(grid[0, 0])
