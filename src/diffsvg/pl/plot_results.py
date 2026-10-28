@@ -4,7 +4,9 @@
 
 - ``adata.varm[stats_key]`` (default ``"dsvg_stats"``): per-gene statistics,
   including ``integral`` (area between the two predicted condition curves)
-  and ``gamma_pval``/``gamma_pval_adj``/``empirical_pval``/``empirical_pval_adj``.
+  and the test's p-values: ``gamma_pval``/``empirical_pval`` (and ``_adj``)
+  for ``test="wald"``, ``parallel_pval``/``parallel_pval_adj`` with
+  ``slope_diff``/``shape_diff`` for ``test="parallel"``.
 - ``adata.varm[preds_key]`` (default ``"dsvg_preds"``): the per-gene,
   per-bin ``condition==1`` minus ``condition==0`` difference curve.
 - Six ``adata.varm[f"{curves_key}_..."]`` entries (default prefix
@@ -17,6 +19,7 @@ The three plots below consume those directly.
 import holoviews as hv
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 # ============================================================
 # Label placement helpers (used by plot_volcano)
@@ -176,11 +179,24 @@ def _place_label(
     return _finalize(best_cand, best)
 
 
+def _is_parallel_table(stats_df):
+    """Whether `stats_df` comes from ``fit_model(..., test="parallel")`` rather than the Wald test."""
+    return "parallel_pval" in stats_df.columns and "gamma_pval" not in stats_df.columns
+
+
+_AXIS_LABELS = {
+    # `integral` is the area under f1 - f0 (condition 1 minus condition 0).
+    "integral": r"$\Delta_{f_1 - f_0}$",
+    "slope_diff": r"$\Delta$ slope ($f_1 - f_0$)",
+    "shape_diff": "shape difference",
+}
+
+
 def plot_volcano(
     stats_df,
-    x="integral",
-    pvalue="gamma_pval",
-    pvalue_adj="gamma_pval_adj",
+    x=None,
+    pvalue=None,
+    pvalue_adj=None,
     alpha=0.05,
     show_dots=True,
     n_label=20,
@@ -197,15 +213,21 @@ def plot_volcano(
     stats_df
         A statistics table indexed by gene, e.g. ``adata.varm["dsvg_stats"]``.
     x
-        Column used for the x-axis (area between the two condition curves).
+        Column used for the x-axis. Defaults to ``"integral"`` (area between
+        the two condition curves) for the Wald test and ``"slope_diff"``
+        (linear trend of ``f1 - f0`` over the anchor range) for
+        ``test="parallel"``; ``"integral"`` there shows level against shape.
     pvalue
         Column used for the y-axis, plotted as ``-log10(pvalue)``. Every
         point above the ``-log10(alpha)`` reference line is colored by the
         sign of `x` (blue = positive, red = negative); points at or below it
-        are black.
+        are black. Defaults to ``"gamma_pval"`` for the Wald test and
+        ``"parallel_pval"`` for ``test="parallel"``. p-values of exactly 0
+        (underflow) are drawn at the smallest non-zero one.
     pvalue_adj
         Column used to rank genes for labeling (the `n_label` genes with the
         smallest `pvalue_adj` among those above the line get a text label).
+        Defaults to the adjusted version of the default `pvalue`.
     alpha
         Significance threshold on `pvalue`, drawn as a horizontal reference
         line at ``-log10(alpha)`` and used for the color cutoff described
@@ -242,6 +264,15 @@ def plot_volcano(
     -------
     matplotlib.axes.Axes
     """
+    if _is_parallel_table(stats_df):
+        defaults = ("slope_diff", "parallel_pval", "parallel_pval_adj")
+    else:
+        defaults = ("integral", "gamma_pval", "gamma_pval_adj")
+    x, pvalue, pvalue_adj = (
+        given if given is not None else default
+        for given, default in zip((x, pvalue, pvalue_adj), defaults, strict=True)
+    )
+
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
     fig = ax.get_figure()
@@ -257,7 +288,10 @@ def plot_volcano(
         raise KeyError(f"highlight_genes not found in stats_df.index: {missing}")
 
     x_vals = stats_df[x]
-    minus_log10_p = -np.log10(stats_df[pvalue])
+    pvals = stats_df[pvalue].to_numpy(dtype=float)
+    positive = pvals[pvals > 0]
+    floor = positive.min() if positive.size else np.finfo(float).tiny
+    minus_log10_p = pd.Series(-np.log10(np.where(pvals > 0, pvals, floor)), index=stats_df.index)
     threshold = -np.log10(alpha)
     sig = minus_log10_p > threshold
     pos_sign = x_vals > 0
@@ -315,7 +349,7 @@ def plot_volcano(
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.set_xlabel(r"$\Delta_{f_0 - f_1}$", fontsize=12)
+    ax.set_xlabel(_AXIS_LABELS.get(x, x), fontsize=12)
     ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=12)
     ax.tick_params(labelsize=10)
 
@@ -474,7 +508,7 @@ def plot_prediction_curve(
 
 def plot_pvalue_histogram(
     stats_df,
-    pvalue="empirical_pval",
+    pvalue=None,
     bins=20,
     ax=None,
     figsize=(4, 4),
@@ -487,7 +521,8 @@ def plot_pvalue_histogram(
     stats_df
         A statistics table indexed by gene, e.g. ``adata.varm["dsvg_stats"]``.
     pvalue
-        Column to histogram.
+        Column to histogram. Defaults to ``"empirical_pval"`` for the Wald
+        test and ``"parallel_pval"`` for ``test="parallel"``.
     bins
         Passed to `matplotlib.axes.Axes.hist`.
     ax
@@ -501,6 +536,8 @@ def plot_pvalue_histogram(
     -------
     matplotlib.axes.Axes
     """
+    if pvalue is None:
+        pvalue = "parallel_pval" if _is_parallel_table(stats_df) else "empirical_pval"
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 
