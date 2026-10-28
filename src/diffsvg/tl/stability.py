@@ -182,7 +182,9 @@ def check_stability(
     """
     unknown = set(grid) - set(_BIN_PARAMS) - set(_MODEL_PARAMS)
     if unknown:
-        raise ValueError(f"Unknown grid parameter(s) {sorted(unknown)}. Available: {sorted(_BIN_PARAMS + _MODEL_PARAMS)}")
+        raise ValueError(
+            f"Unknown grid parameter(s) {sorted(unknown)}. Available: {sorted(_BIN_PARAMS + _MODEL_PARAMS)}"
+        )
     if not grid:
         raise ValueError("`grid` is empty - pass at least one parameter to vary.")
 
@@ -192,7 +194,9 @@ def check_stability(
     base_seed = sample_kwargs.pop("random_seed", 42)
 
     axes = list(grid)
-    configs = [dict(defaults, **dict(zip(axes, combo, strict=True))) for combo in itertools.product(*(grid[a] for a in axes))]
+    configs = [
+        dict(defaults, **dict(zip(axes, combo, strict=True))) for combo in itertools.product(*(grid[a] for a in axes))
+    ]
 
     baseline_config = dict(defaults, **{a: grid[a][0] for a in axes})
     if baseline is not None:
@@ -212,9 +216,7 @@ def check_stability(
 
     baseline_label = label_for(baseline_config)
     runs = [(label_for(config), config, base_seed) for config in configs]
-    runs += [
-        (f"{baseline_label} (reseed {i})", baseline_config, base_seed + i) for i in range(1, max(1, int(n_seeds)))
-    ]
+    runs += [(f"{baseline_label} (reseed {i})", baseline_config, base_seed + i) for i in range(1, max(1, int(n_seeds)))]
 
     # Group by binning signature so each distinct binning is computed once.
     grouped = {}
@@ -235,9 +237,7 @@ def check_stability(
             **{p: bin_config[p] for p in _BIN_PARAMS},
         )
         for label, config, seed in group:
-            model_setup = DiffSVGModelSetup(
-                binned=binned, likelihood=config["likelihood"], priors=config["priors"]
-            )
+            model_setup = DiffSVGModelSetup(binned=binned, likelihood=config["likelihood"], priors=config["priors"])
             stats_df, _, _ = fit_model(
                 adata,
                 model_setup,
@@ -283,9 +283,7 @@ def check_stability(
                     "top_overlap": float(top_overlap.loc[baseline_label, label]),
                 }
             )
-    sensitivity = pd.DataFrame(
-        sensitivity_rows, columns=["parameter", "value", "run", "spearman", "top_overlap"]
-    )
+    sensitivity = pd.DataFrame(sensitivity_rows, columns=["parameter", "value", "run", "spearman", "top_overlap"])
 
     config_table = pd.DataFrame(
         [{a: _format_value(config[a]) for a in axes} for _, config, _ in runs], index=[label for label, _, _ in runs]
