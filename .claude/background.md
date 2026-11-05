@@ -67,6 +67,13 @@ The package follows the scverse `pp`/`tl`/`pl` convention. The intended order of
   a one-factor-at-a-time sensitivity breakdown, and a noise floor from re-running the baseline under
   a different seed, so a ranking change can be judged against how much the ranking moves from MCMC
   noise alone.
+- `cluster_curves(adata, by="average", n_clusters=5, genes=None, scale=False, ...)` - k-means (sklearn) on the posterior
+  means of the spline coefficients, which `fit_model` now writes to `adata.varm["dsvg_coefs_beta"]` and
+  `["dsvg_coefs_beta_1"]` (`fit_profiles`: `["dsvg_profiles_beta"]`). `by="average"` is `beta + beta_1 / 2`, the combined
+  curve (mean of the two condition curves), `"interaction"` is `beta_1`, `"profile"` the condition-free fit. `beta` alone
+  is the curve of condition 0 under the 0/1 coding, so it is not offered. Mean coefficient removed always (that direction does not change
+  the curve); `scale=True` adds unit length. `n_init=100` by default: 10 gave up to 25 partitions over 30 seeds. Writes
+  `adata.var[key]` and `adata.uns[key]`.
 - `DEFAULT_PRIORS` / the `priors=` argument of `setup_model` - every prior is overridable, e.g.
   `priors={"beta": ("normal", 0.0, 2.0)}`; unset ones keep the hardcoded defaults.
 
@@ -76,6 +83,9 @@ The package follows the scverse `pp`/`tl`/`pl` convention. The intended order of
 - `plot_prediction_curve(adata, gene, ...)` - the predicted curve(s) with uncertainty band for one
   gene, or a grid of panels (4 per row by default) for several.
 - `plot_pvalue_histogram(stats_df, ...)` - QC histogram of a p-value column.
+- `plot_cluster_curves(adata, cluster_key, curves=None, ...)` - a `cluster_curves` result as one holoviews panel per
+  cluster with each gene's curve overlaid: `curves` is `"combined"`, `"conditions"` (two panels per cluster),
+  `"difference"` or a condition label (that condition alone), by default the curves the clustering compared.
 - `plot_stability(result, kind="heatmap"|"sensitivity", ...)` - visualizes a `check_stability`
   result: a clustered agreement heatmap across runs, or a bar chart of which single parameter change
   moved the ranking the most.
