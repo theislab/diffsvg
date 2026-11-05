@@ -1,3 +1,4 @@
+from .clustering import cluster_curves
 from .model import (
     DiffSVGModelSetup,
     fit_model,
@@ -13,6 +14,7 @@ __all__ = [
     "DiffSVGModelSetup",
     "StabilityResult",
     "check_stability",
+    "cluster_curves",
     "fit_model",
     "fit_profiles",
     "one_vs_rest",

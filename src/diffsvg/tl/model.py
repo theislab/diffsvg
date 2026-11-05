@@ -1062,7 +1062,9 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
     (each of length ``len(shared.B_pred)``): the ``condition==1`` minus
     ``condition==0`` curve (``"delta"``), and, per condition, the posterior
     mean curve and a 94% equal-tailed credible band (``"cond{0,1}_mean"``,
-    ``"cond{0,1}_ci_low"``, ``"cond{0,1}_ci_high"``). `ss_within` is this
+    ``"cond{0,1}_ci_low"``, ``"cond{0,1}_ci_high"``), plus the posterior means
+    of the spline coefficients (``"beta"``, ``"beta_1"``, of length
+    ``shared.n_bsplines``, not on the grid). `ss_within` is this
     gene's within-row term for weighted bins (see `_weighting`), `seeds` the
     posterior-predictive seeds for the two condition levels.
     """
@@ -1149,6 +1151,8 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
             # has stayed stable.
             post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
             ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
+            beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
+            beta_1_mean = idata.posterior["beta_1"].mean(("chain", "draw")).to_numpy()
 
     stats_row = {
         "gene": gene,
@@ -1167,6 +1171,8 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
         "cond1_mean": cond1_mean,
         "cond1_ci_low": cond1_ci_low,
         "cond1_ci_high": cond1_ci_high,
+        "beta": beta_mean,
+        "beta_1": beta_1_mean,
     }
     return gene, stats_row, curve_row
 
@@ -1205,6 +1211,7 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
         draws = pred.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
         mean = draws.mean(axis=0)
         ci_low, ci_high = np.quantile(draws, [0.03, 0.97], axis=0)
+        beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
 
         diag_vars = ["intercept", "beta", "sigma"]
         n_divergent = int(idata.sample_stats["diverging"].sum()) if "diverging" in idata.sample_stats else 0
@@ -1214,7 +1221,7 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
         ess_bulk_min = float(min(np.asarray(ess_ds[v]).min() for v in ess_ds.data_vars))
 
     diag_row = {"gene": gene, "n_divergent": n_divergent, "rhat_max": rhat_max, "ess_bulk_min": ess_bulk_min}
-    curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high}
+    curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high, "beta": beta_mean}
     return gene, diag_row, curve_row
 
 
@@ -1305,6 +1312,12 @@ _TESTS = {
 
 
 _CURVE_SUFFIXES = ("cond0_mean", "cond0_ci_low", "cond0_ci_high", "cond1_mean", "cond1_ci_low", "cond1_ci_high")
+_COEF_NAMES = ("beta", "beta_1")
+
+
+def _coef_columns(n_bsplines):
+    """Column labels of a coefficient table, one per spline basis function (strings, so they round-trip through h5ad)."""
+    return [f"B{k}" for k in range(n_bsplines)]
 
 
 def fit_model(
@@ -1323,6 +1336,7 @@ def fit_model(
     tau=0.1,
     predictive_seed=None,
     inference="nuts",
+    coefs_key="dsvg_coefs",
     **pymc_kwargs,
 ):
     """Fit every per-gene model from `setup_model`, in parallel, and summarize the result.
@@ -1365,7 +1379,8 @@ def fit_model(
         If `True` (default), write results to `adata.varm`/`adata.uns`
         (aligned to ``adata.var_names``, with genes not in `model_setup`
         left as `NaN`) and return `None`. If `False`, leave `adata` untouched
-        and return ``(stats_df, preds_df, curve_dfs)``.
+        and return ``(stats_df, preds_df, curve_dfs)``; `curve_dfs` then also
+        holds the coefficient tables under ``"beta"`` and ``"beta_1"``.
     stats_key
         `adata.varm` key for the per-gene summary statistics (`n_genes x n`;
         see `diffsvg.pl.plot_volcano`/`diffsvg.pl.plot_pvalue_histogram`).
@@ -1466,6 +1481,13 @@ def fit_model(
           (``_VI_SLIDE_DEFAULTS``), the stats gain ``sample_level_sd`` and
           ``sample_curve_sd``, and ``vi_ess`` above ~0.1 suffices: it falls
           with the number of parameters even for a good approximation.
+    coefs_key
+        Prefix for two `adata.varm` tables (`n_genes x n_bsplines`) with the
+        posterior means of the spline coefficients, consumed by
+        `diffsvg.tl.cluster_curves`: ``f"{coefs_key}_beta"`` (the main spline
+        term; with the 0/1 condition coding this is the curve of condition 0,
+        not a pooled one) and ``f"{coefs_key}_beta_1"`` (the interaction, how
+        the curve of condition 1 differs from it).
 
     Returns
     -------
@@ -1598,15 +1620,25 @@ def fit_model(
         ).reindex(binned.genes)
         for suffix in _CURVE_SUFFIXES
     }
+    coef_dfs = {
+        name: pd.DataFrame.from_dict(
+            {gene: row[name] for gene, row in curve_rows.items()},
+            orient="index",
+            columns=_coef_columns(binned.n_bsplines),
+        ).reindex(binned.genes)
+        for name in _COEF_NAMES
+    }
 
     if not inplace:
         stats_df.attrs.update(test_params)
-        return stats_df, preds_df, curve_dfs
+        return stats_df, preds_df, {**curve_dfs, **coef_dfs}
 
     adata.varm[stats_key] = stats_df.reindex(adata.var_names)
     adata.varm[preds_key] = preds_df.reindex(adata.var_names)
     for suffix, df in curve_dfs.items():
         adata.varm[f"{curves_key}_{suffix}"] = df.reindex(adata.var_names)
+    for name, df in coef_dfs.items():
+        adata.varm[f"{coefs_key}_{name}"] = df.reindex(adata.var_names)
     adata.uns[f"{curves_key}_condition_categories"] = binned.condition_categories
     adata.uns[f"{stats_key}_params"] = test_params
     return None
@@ -1662,7 +1694,10 @@ def fit_profiles(
         Prefix for three `adata.varm` tables (`n_genes x (n_bins + 1)`), one
         per ``{"mean", "ci_low", "ci_high"}``, plus a
         ``f"{profiles_key}_diagnostics"`` table of per-gene sampler
-        diagnostics.
+        diagnostics and ``f"{profiles_key}_beta"`` (`n_genes x n_bsplines`,
+        the posterior means of the spline coefficients, for
+        `diffsvg.tl.cluster_curves` with ``by="profile"``). With
+        ``inplace=False`` that table is ``profile_dfs["beta"]``.
 
     Returns
     -------
@@ -1729,6 +1764,11 @@ def fit_profiles(
         ).reindex(binned.genes)
         for suffix in _PROFILE_SUFFIXES
     }
+    profile_dfs["beta"] = pd.DataFrame.from_dict(
+        {gene: row["beta"] for gene, row in curve_rows.items()},
+        orient="index",
+        columns=_coef_columns(binned.n_bsplines),
+    ).reindex(binned.genes)
 
     if not inplace:
         return profile_dfs, diagnostics_df

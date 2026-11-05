@@ -13,3 +13,4 @@ and this project adheres to [Semantic Versioning][].
 ### Added
 
 - Basic tool, preprocessing and plotting functions
+- `tl.cluster_curves` and `pl.plot_cluster_curves`: k-means on the coefficients of the combined curve or the interaction, which `fit_model` and `fit_profiles` now store
