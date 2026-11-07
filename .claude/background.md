@@ -83,7 +83,7 @@ The package follows the scverse `pp`/`tl`/`pl` convention. The intended order of
 - `plot_prediction_curve(adata, gene, ...)` - the predicted curve(s) with uncertainty band for one
   gene, or a grid of panels (4 per row by default) for several.
 - `plot_pvalue_histogram(stats_df, ...)` - QC histogram of a p-value column.
-- `plot_cluster_curves(adata, cluster_key, curves=None, ...)` - a `cluster_curves` result as one holoviews panel per
+- `plot_cluster_curves(adata, cluster_key, curves=None, ...)` - a `cluster_curves` result as one panel per
   cluster with each gene's curve overlaid: `curves` is `"combined"`, `"conditions"` (two panels per cluster),
   `"difference"` or a condition label (that condition alone), by default the curves the clustering compared.
 - `plot_stability(result, kind="heatmap"|"sensitivity", ...)` - visualizes a `check_stability`

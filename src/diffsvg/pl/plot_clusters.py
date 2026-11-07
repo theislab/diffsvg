@@ -1,7 +1,7 @@
 """Plots for the output of `diffsvg.tl.cluster_curves`."""
 
 import colorcet
-import holoviews as hv
+import matplotlib.pyplot as plt
 import numpy as np
 
 from diffsvg.tl.model import _gene_profiles
@@ -48,8 +48,14 @@ def _legend_cols(n_genes):
     return (n_genes + 23) // 24
 
 
+#: Inches around a panel: the axis labels on its left, the title above and the x-axis label below it.
+_PANEL_MARGINS = {"left": 0.65, "right": 0.15, "top": 0.4, "bottom": 0.55}
+#: Inches a legend column takes next to a panel.
+_LEGEND_COLUMN_WIDTH = 1.0
+
 _Y_LABELS = {"none": "smoothed expression", "center": "centred expression", "zscore": "z-scored expression"}
 _DEFAULT_CURVES = {"interaction": "difference", "average": "combined", "profile": "combined"}
+_GENE_COLOURS = colorcet.b_glasbey_category10
 
 
 def plot_cluster_curves(
@@ -61,17 +67,12 @@ def plot_cluster_curves(
     curves_key="dsvg_curves",
     profiles_key="dsvg_profiles",
     ncols=3,
-    figsize=(5, 4),
+    figsize=(4, 3.2),
     show_legend=True,
     dpi=300,
     save_path=None,
 ):
     """One curve plot per cluster, with the fitted curve of each gene overlaid in its own colour.
-
-    Returns a :mod:`holoviews` object, like
-    `diffsvg.pl.plot_prediction_curve`, so in a notebook it renders itself and
-    it restyles with ``.opts(...)``. If no holoviews backend is loaded yet, the
-    matplotlib one is loaded.
 
     Parameters
     ----------
@@ -116,11 +117,12 @@ def plot_cluster_curves(
     dpi
         Resolution used when saving to `save_path`.
     save_path
-        If given, save the plot here with ``hv.save``.
+        If given, save the figure here (``bbox_inches="tight"``).
 
     Returns
     -------
-    An `hv.Layout` with one panel per cluster, or two with ``curves="conditions"``.
+    An array of `matplotlib.axes.Axes`, row by row: one panel per cluster, or
+    two with ``curves="conditions"``. Each gene is a line labelled with its name.
 
     Examples
     --------
@@ -146,18 +148,39 @@ def plot_cluster_curves(
         unknown = [c for c in clusters if c not in assignment.cat.categories]
         if unknown:
             raise KeyError(f"clusters not found in adata.var[{cluster_key!r}]: {unknown}")
-    if hv.Store.current_backend not in hv.Store.renderers:
-        hv.extension("matplotlib")
 
     width, height = figsize
-    x_dim = hv.Dimension("distance", label="Normalized distance")
-    y_dim = hv.Dimension("expression", label=_Y_LABELS[standardize])
-    panel_opts = (
-        hv.opts.Overlay(fig_inches=figsize, aspect=width / height, backend="matplotlib"),
-        hv.opts.Overlay(width=round(width * 72), height=round(height * 72), backend="bokeh"),
+    n_panels = len(clusters) * len(tables)
+    ncols = len(tables) if len(tables) > 1 else max(1, min(ncols, n_panels))
+    nrows = (n_panels + ncols - 1) // ncols
+    # The legends sit next to their panels: the gap holds the widest one and the figure grows by it, so
+    # panels keep the size asked for. With two panels per cluster the legend is right of the row, not in its gap.
+    largest = max((assignment == c).sum() for c in clusters)
+    legend_width = _LEGEND_COLUMN_WIDTH * _legend_cols(largest) if show_legend else 0.0
+    gap_x = _PANEL_MARGINS["left"] + _PANEL_MARGINS["right"] + (legend_width if len(tables) == 1 else 0.0)
+    gap_y = _PANEL_MARGINS["top"] + _PANEL_MARGINS["bottom"]
+    fig_width = ncols * width + (ncols - 1) * gap_x + _PANEL_MARGINS["left"] + _PANEL_MARGINS["right"] + legend_width
+    fig_height = nrows * height + (nrows - 1) * gap_y + gap_y
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        gridspec_kw={
+            "left": _PANEL_MARGINS["left"] / fig_width,
+            "right": 1.0 - (_PANEL_MARGINS["right"] + legend_width) / fig_width,
+            "bottom": _PANEL_MARGINS["bottom"] / fig_height,
+            "top": 1.0 - _PANEL_MARGINS["top"] / fig_height,
+            "wspace": gap_x / width,
+            "hspace": gap_y / height,
+        },
     )
+    axes = axes.ravel()
+    for spare in axes[n_panels:]:
+        spare.set_visible(False)
+
     x = next(iter(tables.values())).columns.to_numpy(dtype=float)
-    panels = []
+    panels = iter(axes)
     for cluster in clusters:
         genes = list(assignment.index[assignment == cluster])
         joined = _standardise(np.hstack([t.loc[genes].to_numpy(dtype=float) for t in tables.values()]), standardize)
@@ -166,51 +189,28 @@ def plot_cluster_curves(
         margin = 0.05 * (np.nanmax(joined) - np.nanmin(joined)) or 1.0
         ylim = (float(np.nanmin(joined) - margin), float(np.nanmax(joined) + margin))
         for i, (suffix, values) in enumerate(zip(tables, lines, strict=True)):
-            curve_layers = [
-                hv.Curve((x, values[g]), x_dim, y_dim, label=gene).opts(
-                    hv.opts.Curve(color=colorcet.b_glasbey_category10[g % len(colorcet.b_glasbey_category10)])
-                )
-                for g, gene in enumerate(genes)
-            ]
-            title = f"Cluster {cluster} (n={len(genes)})" + (f", {suffix}" if suffix else "")
+            ax = next(panels)
+            for g, gene in enumerate(genes):
+                ax.plot(x, values[g], color=_GENE_COLOURS[g % len(_GENE_COLOURS)], label=gene, lw=1.2)
+            ax.set_ylim(ylim)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.set_xlabel("Normalized distance")
+            ax.set_ylabel(_Y_LABELS[standardize])
+            ax.set_title(f"Cluster {cluster} (n={len(genes)})" + (f", {suffix}" if suffix else ""), fontsize=11)
             # With two panels per cluster one legend is enough; it goes next to the second.
-            legend = show_legend and i == len(tables) - 1
-            panels.append(
-                hv.Overlay(curve_layers).opts(
-                    *panel_opts,
-                    hv.opts.Overlay(title=title, show_legend=legend, ylim=ylim),
-                    hv.opts.Overlay(
-                        legend_position="right",
-                        legend_cols=_legend_cols(len(genes)),
-                        legend_limit=len(genes) + 1,
-                        fontsize={"legend": 7},
-                        backend="matplotlib",
-                    ),
+            if show_legend and i == len(tables) - 1:
+                ax.legend(
+                    loc="upper left",
+                    bbox_to_anchor=(1.01, 1.0),
+                    ncols=_legend_cols(len(genes)),
+                    frameon=False,
+                    fontsize=7,
+                    borderaxespad=0.0,
+                    handlelength=1.2,
+                    columnspacing=0.8,
                 )
-            )
 
-    ncols = len(tables) if len(tables) > 1 else max(1, min(ncols, len(panels)))
-    nrows = (len(panels) + ncols - 1) // ncols
-    # The legends sit between the panels of a row: the gap holds the widest one and the figure grows
-    # by it, so panels keep the size asked for.
-    largest = max((assignment == c).sum() for c in clusters)
-    legend_width = 1.2 * _legend_cols(largest) if show_legend else 0.0
-    hspace = 0.25 + legend_width / width
-    plot = (
-        hv.Layout(panels)
-        .opts(
-            hv.opts.Curve(axiswise=True),
-            hv.opts.Layout(shared_axes=False, backend="bokeh"),
-            hv.opts.Layout(
-                fig_inches=(ncols * (1.25 * width + legend_width), nrows * 1.35 * height),
-                hspace=hspace,
-                vspace=0.35,
-                sublabel_format="",
-                backend="matplotlib",
-            ),
-        )
-        .cols(ncols)
-    )
     if save_path is not None:
-        hv.save(plot, save_path, dpi=dpi)
-    return plot
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    return axes[:n_panels]

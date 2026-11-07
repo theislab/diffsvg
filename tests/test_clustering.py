@@ -1,5 +1,8 @@
+import subprocess
+import sys
+
 import anndata as ad
-import holoviews as hv
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
@@ -152,8 +155,14 @@ def test_cluster_curves_rejects_bad_input():
         dvg.tl.cluster_curves(adata, n_clusters=1000)
 
 
+@pytest.fixture(autouse=True)
+def _close_figures():
+    yield
+    plt.close("all")
+
+
 def _panel_curves(panel):
-    return {c.label: c for c in panel.values()}
+    return {line.get_label(): line for line in panel.get_lines()}
 
 
 def test_one_panel_per_cluster_with_every_gene_in_its_own_colour():
@@ -164,7 +173,7 @@ def test_one_panel_per_cluster_with_every_gene_in_its_own_colour():
     for panel, cluster in zip(plot, ["0", "1"], strict=True):
         members = set(adata.var_names[adata.var["dsvg_cluster_average"] == cluster])
         assert set(_panel_curves(panel)) == members
-        colors = [hv.Store.lookup_options("matplotlib", c, "style").kwargs["color"] for c in panel.values()]
+        colors = [line.get_color() for line in panel.get_lines()]
         assert len(set(colors)) == len(members)
 
 
@@ -178,7 +187,7 @@ def test_default_curves_are_the_ones_the_clustering_compared():
     def first_curve(key, **kwargs):
         panel = dvg.pl.plot_cluster_curves(adata, key, standardize="none", **kwargs)[0]
         label, curve = next(iter(_panel_curves(panel).items()))
-        return label, curve.dimension_values("expression")
+        return label, curve.get_ydata()
 
     gene, y = first_curve("dsvg_cluster_interaction")
     np.testing.assert_allclose(y, diff.loc[gene])
@@ -198,13 +207,12 @@ def test_conditions_are_two_panels_per_cluster_and_keep_the_gap():
     assert len(plot) == 4
     ctrl, shh = plot[0], plot[1]
     gene = next(iter(_panel_curves(ctrl)))
-    y0 = _panel_curves(ctrl)[gene].dimension_values("expression")
-    y1 = _panel_curves(shh)[gene].dimension_values("expression")
+    y0 = _panel_curves(ctrl)[gene].get_ydata()
+    y1 = _panel_curves(shh)[gene].get_ydata()
     # centred over both conditions together, so the 2.0 level gap between them is still there
     assert (y1 - y0).mean() == pytest.approx(2.0, abs=1e-9)
     assert (np.r_[y0, y1]).mean() == pytest.approx(0.0, abs=1e-9)
-    opts = [hv.Store.lookup_options("matplotlib", p, "plot").kwargs["ylim"] for p in (ctrl, shh)]
-    assert opts[0] == opts[1]
+    assert ctrl.get_ylim() == shh.get_ylim()
 
 
 @pytest.mark.parametrize(("label", "table"), [("Ctrl", "dsvg_curves_cond0_mean"), ("SHH", "dsvg_curves_cond1_mean")])
@@ -213,14 +221,14 @@ def test_a_condition_label_draws_that_condition_alone(label, table):
     dvg.tl.cluster_curves(adata, by="interaction", n_clusters=2)
     plot = dvg.pl.plot_cluster_curves(adata, "dsvg_cluster_interaction", curves=label, standardize="none")
     assert len(plot) == 2  # one panel per cluster, not two
-    assert hv.Store.lookup_options("matplotlib", plot[0], "plot").kwargs["title"].endswith(f", {label}")
+    assert plot[0].get_title().endswith(f", {label}")
     for panel in plot:
         for gene, curve in _panel_curves(panel).items():
-            np.testing.assert_allclose(curve.dimension_values("expression"), adata.varm[table].loc[gene])
+            np.testing.assert_allclose(curve.get_ydata(), adata.varm[table].loc[gene])
 
     centred = dvg.pl.plot_cluster_curves(adata, "dsvg_cluster_interaction", curves=label)[0]
     for curve in _panel_curves(centred).values():
-        assert curve.dimension_values("expression").mean() == pytest.approx(0.0, abs=1e-9)
+        assert curve.get_ydata().mean() == pytest.approx(0.0, abs=1e-9)
 
 
 def test_standardize_is_per_gene_and_follows_the_clustering():
@@ -228,14 +236,14 @@ def test_standardize_is_per_gene_and_follows_the_clustering():
     dvg.tl.cluster_curves(adata, by="average", n_clusters=2, scale=True, key_added="scaled")
     dvg.tl.cluster_curves(adata, by="average", n_clusters=2, key_added="raw")
     panel = dvg.pl.plot_cluster_curves(adata, "scaled")[0]
-    for curve in panel.values():
-        y = curve.dimension_values("expression")
+    for curve in panel.get_lines():
+        y = curve.get_ydata()
         assert y.mean() == pytest.approx(0, abs=1e-9)
         assert y.std() == pytest.approx(1, abs=1e-9)
-    assert panel.values()[0].vdims[0].label == "z-scored expression"
-    raw = dvg.pl.plot_cluster_curves(adata, "raw")[0].values()[0]
-    assert raw.vdims[0].label == "centred expression"
-    assert raw.dimension_values("expression").mean() == pytest.approx(0, abs=1e-9)
+    assert panel.get_ylabel() == "z-scored expression"
+    raw = dvg.pl.plot_cluster_curves(adata, "raw")[0]
+    assert raw.get_ylabel() == "centred expression"
+    assert raw.get_lines()[0].get_ydata().mean() == pytest.approx(0, abs=1e-9)
 
 
 def test_plot_cluster_curves_renders_and_rejects_bad_input(tmp_path):
@@ -254,6 +262,63 @@ def test_plot_cluster_curves_renders_and_rejects_bad_input(tmp_path):
         dvg.pl.plot_cluster_curves(adata, "dsvg_cluster_interaction", curves="nope")
     with pytest.raises(ValueError, match="Unknown standardize"):
         dvg.pl.plot_cluster_curves(adata, "dsvg_cluster_interaction", standardize="nope")
+
+
+def _with_curves():
+    """`_fitted` plus the credible bands that `plot_prediction_curve` also reads."""
+    adata, *_ = _fitted()
+    for cat in (0, 1):
+        mean = adata.varm[f"dsvg_curves_cond{cat}_mean"]
+        adata.varm[f"dsvg_curves_cond{cat}_ci_low"] = mean - 0.5
+        adata.varm[f"dsvg_curves_cond{cat}_ci_high"] = mean + 0.5
+    return adata
+
+
+def test_prediction_curve_draws_both_conditions_with_their_bands():
+    adata = _with_curves()
+    ax = dvg.pl.plot_prediction_curve(adata, gene="g0")
+    assert ax.get_title() == "g0"
+    assert len(ax.collections) == 2  # the two bands
+    labels = {line.get_label(): line for line in ax.get_lines()}
+    assert set(labels) == {"Ctrl", "SHH"}
+    np.testing.assert_allclose(labels["SHH"].get_ydata(), adata.varm["dsvg_curves_cond1_mean"].loc["g0"])
+    x = adata.varm["dsvg_curves_cond1_mean"].columns.to_numpy(dtype=float)
+    np.testing.assert_allclose(labels["SHH"].get_xdata(), x)
+
+
+def test_prediction_curve_grid_has_one_panel_per_gene_in_order_and_one_legend():
+    adata = _with_curves()
+    genes = ["g3", "g0", "g5", "g1", "g2"]
+    axes = dvg.pl.plot_prediction_curve(adata, gene=genes, ncols=2)
+    assert [a.get_title() for a in axes] == genes
+    assert axes[0].get_gridspec().get_geometry() == (3, 2)
+    assert [a.get_legend() is not None for a in axes] == [True, False, False, False, False]
+    # a one-element list is one panel, like the bare name
+    assert dvg.pl.plot_prediction_curve(adata, gene=["g0"]).get_title() == "g0"
+
+
+def test_prediction_curve_draws_into_a_given_axes_and_saves(tmp_path):
+    adata = _with_curves()
+    _, given = plt.subplots()
+    out = tmp_path / "curve.png"
+    assert dvg.pl.plot_prediction_curve(adata, gene="g0", ax=given, dpi=60, save_path=str(out)) is given
+    assert out.stat().st_size > 0
+
+
+def test_prediction_curve_rejects_bad_input():
+    adata = _with_curves()
+    with pytest.raises(ValueError, match="empty"):
+        dvg.pl.plot_prediction_curve(adata, gene=[])
+    with pytest.raises(KeyError, match="not found"):
+        dvg.pl.plot_prediction_curve(adata, gene=["nope"])
+    _, given = plt.subplots()
+    with pytest.raises(ValueError, match="single panel"):
+        dvg.pl.plot_prediction_curve(adata, gene=["g0", "g1"], ax=given)
+
+
+def test_curve_plots_do_not_need_holoviews():
+    code = "import sys; import diffsvg; sys.exit('holoviews' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
 
 
 def _simulated(n_cells=1500, seed=0):
