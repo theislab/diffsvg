@@ -16,7 +16,6 @@
 The three plots below consume those directly.
 """
 
-import holoviews as hv
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -360,35 +359,33 @@ def plot_volcano(
     return ax
 
 
-def _prediction_curve(adata, gene, curves_key, condition_labels, colors):
-    """One gene's two condition curves (mean + credible band) as an `hv.Overlay`."""
-    x_dim = hv.Dimension("distance", label="Normalized distance")
-    y_dim = hv.Dimension("expression", label="smoothed expression")
-    layers = []
+def _panel_grid(n_panels, ncols, figsize):
+    """A figure with `n_panels` axes in rows of `ncols`, each panel `figsize` inches; returns ``(fig, axes)``, flat."""
+    ncols = max(1, min(ncols, n_panels))
+    nrows = (n_panels + ncols - 1) // ncols
+    width, height = figsize
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * width, nrows * height), squeeze=False)
+    axes = axes.ravel()
+    for spare in axes[n_panels:]:
+        spare.set_visible(False)
+    return fig, axes[:n_panels]
+
+
+def _draw_prediction_curve(ax, adata, gene, curves_key, condition_labels, colors):
+    """One gene's two condition curves (mean + credible band) on `ax`."""
     for cat in (0, 1):
         curves = adata.varm[f"{curves_key}_cond{cat}_mean"]
-        mean = curves.loc[gene]
         lower = adata.varm[f"{curves_key}_cond{cat}_ci_low"].loc[gene]
         upper = adata.varm[f"{curves_key}_cond{cat}_ci_high"].loc[gene]
-        # Taken from the columns, not from `mean.index`, so the bin grid is
-        # read off the table itself rather than depending on what `.loc`
-        # happened to return.
+        # Taken from the columns, so the bin grid is read off the table itself.
         x = curves.columns.to_numpy(dtype=float)
-
-        # The band stays unlabelled so each condition shows up once in the legend.
-        band = hv.Area((x, lower.to_numpy(), upper.to_numpy()), x_dim, [y_dim, "expression_upper"])
-        band = band.opts(
-            hv.opts.Area(color=colors[cat], alpha=0.2),
-            hv.opts.Area(edgecolor=colors[cat], backend="matplotlib"),
-        )
-        layers.append(band)
-        line = hv.Curve((x, mean.to_numpy()), x_dim, y_dim, label=condition_labels[str(cat)])
-        layers.append(line.opts(color=colors[cat]))
-
-    return hv.Overlay(layers).opts(
-        hv.opts.Overlay(title=gene),
-        hv.opts.Overlay(legend_position="best", backend="matplotlib"),
-    )
+        ax.fill_between(x, lower.to_numpy(dtype=float), upper.to_numpy(dtype=float), color=colors[cat], alpha=0.2, lw=0)
+        ax.plot(x, curves.loc[gene].to_numpy(dtype=float), color=colors[cat], label=condition_labels[str(cat)])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_xlabel("Normalized distance")
+    ax.set_ylabel("smoothed expression")
+    ax.set_title(gene)
 
 
 def plot_prediction_curve(
@@ -398,7 +395,8 @@ def plot_prediction_curve(
     condition_labels=None,
     colors=None,
     ncols=4,
-    figsize=(6, 5),
+    figsize=(4, 3.2),
+    ax=None,
     dpi=300,
     save_path=None,
 ):
@@ -406,13 +404,8 @@ def plot_prediction_curve(
 
     Reads the six ``adata.varm[f"{curves_key}_cond{0,1}_{mean,ci_low,ci_high}"]``
     tables written by `diffsvg.tl.fit_model`. Several genes are drawn as a
-    grid of panels, one gene each.
-
-    Returns a :mod:`holoviews` object rather than drawing into matplotlib
-    axes, so in a notebook it renders itself as the cell output. Restyle it
-    with ``.opts(...)``. If
-    no holoviews backend is loaded yet, the matplotlib one is loaded; call
-    ``hv.extension("bokeh")`` beforehand for interactive plots.
+    grid of panels, one gene each, each with its own axis ranges because genes
+    differ in scale.
 
     Parameters
     ----------
@@ -433,77 +426,49 @@ def plot_prediction_curve(
         Panels per row when several genes are given. Fewer genes than this
         give a single, narrower row.
     figsize
-        ``(width, height)`` of a *single* panel in inches. One gene gets
-        exactly this size. In a grid the figure is `ncols` panels wide and
-        each panel keeps the ``width / height`` shape. With the bokeh
-        backend it is taken at 72 px per inch.
+        ``(width, height)`` of a *single* panel in inches.
+    ax
+        Existing axes to draw into, for a single gene; a new figure is created
+        if omitted.
     dpi
-        Resolution used when saving to `save_path`. The notebook display
-        uses the holoviews renderer's resolution instead, which
-        ``hv.output(dpi=...)`` changes for the whole session.
+        Resolution used when saving to `save_path`.
     save_path
-        If given, save the plot here with ``hv.save``.
+        If given, save the figure here (``bbox_inches="tight"``).
 
     Returns
     -------
-    An `hv.Overlay` when one gene is given, otherwise an `hv.Layout` of them,
-    one panel per gene in the order passed.
+    A `matplotlib.axes.Axes` when one gene is given, otherwise an array of
+    them, one per gene in the order passed.
 
     Examples
     --------
     >>> dvg.pl.plot_prediction_curve(adata, gene=["PAX7", "IRX3"])
-
-    Options go to the panels, not the `hv.Layout`:
-
-    >>> dvg.pl.plot_prediction_curve(adata, gene=["PAX7", "IRX3"]).opts(hv.opts.Overlay(legend_position="top_left"))
     """
-    single = isinstance(gene, str)
-    genes = [gene] if single else list(gene)
+    genes = [gene] if isinstance(gene, str) else list(gene)
     if not genes:
         raise ValueError("`gene` is empty - pass at least one gene name.")
     missing = [g for g in genes if g not in adata.var_names]
     if missing:
         raise KeyError(f"genes not found in adata.var_names: {missing}")
-    # One gene is one panel however it was passed, so a one-element list
-    # behaves (and returns) exactly like the bare string.
-    single = len(genes) == 1
+    if ax is not None and len(genes) > 1:
+        raise ValueError("`ax` holds a single panel - leave it out to plot several genes.")
 
     if condition_labels is None:
         condition_labels = adata.uns.get(f"{curves_key}_condition_categories", {"0": "condition 0", "1": "condition 1"})
     if colors is None:
         colors = {0: "steelblue", 1: "darkorange"}
-    # Without a loaded backend a holoviews object only shows its text repr.
-    if hv.Store.current_backend not in hv.Store.renderers:
-        hv.extension("matplotlib")
 
-    width, height = figsize
-    panel_size = (
-        hv.opts.Overlay(fig_inches=figsize, aspect=width / height, backend="matplotlib"),
-        hv.opts.Overlay(width=round(width * 72), height=round(height * 72), backend="bokeh"),
-    )
-    panels = [_prediction_curve(adata, g, curves_key, condition_labels, colors).opts(*panel_size) for g in genes]
-    if single:
-        plot = panels[0]
-    else:
-        ncols = max(1, min(ncols, len(genes)))
-        nrows = (len(genes) + ncols - 1) // ncols
-        # One shared legend: repeating it in every panel is just noise.
-        panels = [panels[0], *(p.opts(show_legend=False) for p in panels[1:])]
-        # Genes differ in scale, so each panel keeps its own axis ranges.
-        plot = (
-            hv.Layout(panels)
-            .opts(
-                hv.opts.Curve(axiswise=True),
-                hv.opts.Area(axiswise=True),
-                hv.opts.Layout(shared_axes=False, backend="bokeh"),
-                hv.opts.Layout(fig_inches=(ncols * width, nrows * height), sublabel_format="", backend="matplotlib"),
-            )
-            .cols(ncols)
-        )
+    fig, axes = (ax.get_figure(), np.array([ax])) if ax is not None else _panel_grid(len(genes), ncols, figsize)
+    for panel, name in zip(axes, genes, strict=True):
+        _draw_prediction_curve(panel, adata, name, curves_key, condition_labels, colors)
+    # One shared legend: repeating it in every panel is just noise.
+    axes[0].legend(frameon=False, fontsize=9)
+    if ax is None:
+        fig.tight_layout()
 
     if save_path is not None:
-        hv.save(plot, save_path, dpi=dpi)
-    return plot
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    return axes[0] if len(genes) == 1 else axes
 
 
 def plot_pvalue_histogram(
