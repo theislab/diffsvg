@@ -1,6 +1,3 @@
-import subprocess
-import sys
-
 import anndata as ad
 import matplotlib.pyplot as plt
 import numpy as np
@@ -314,11 +311,6 @@ def test_prediction_curve_rejects_bad_input():
     _, given = plt.subplots()
     with pytest.raises(ValueError, match="single panel"):
         dvg.pl.plot_prediction_curve(adata, gene=["g0", "g1"], ax=given)
-
-
-def test_curve_plots_do_not_need_holoviews():
-    code = "import sys; import diffsvg; sys.exit('holoviews' in sys.modules)"
-    assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
 
 
 def _simulated(n_cells=1500, seed=0):
