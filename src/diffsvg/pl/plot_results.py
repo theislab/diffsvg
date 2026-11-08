@@ -1,20 +1,4 @@
-"""Plots for the output of `diffsvg.tl.fit_model`.
-
-`fit_model` writes:
-
-- ``adata.varm[stats_key]`` (default ``"dsvg_stats"``): per-gene statistics,
-  including ``integral`` (area between the two predicted condition curves)
-  and the test's p-values: ``gamma_pval``/``empirical_pval`` (and ``_adj``)
-  for ``test="wald"``, ``parallel_pval``/``parallel_pval_adj`` with
-  ``slope_diff``/``shape_diff`` for ``test="parallel"``.
-- ``adata.varm[preds_key]`` (default ``"dsvg_preds"``): the per-gene,
-  per-bin ``condition==1`` minus ``condition==0`` difference curve.
-- Six ``adata.varm[f"{curves_key}_..."]`` entries (default prefix
-  ``"dsvg_curves"``) and ``adata.uns[f"{curves_key}_condition_categories"]``:
-  the per-condition predicted curves with a credible band.
-
-The three plots below consume those directly.
-"""
+"""Plots for the output of `diffsvg.tl.fit_model`: the statistics table and the per-condition curves."""
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,11 +7,8 @@ import pandas as pd
 # ============================================================
 # Label placement helpers (used by plot_volcano)
 # ============================================================
-# Lightweight, dependency-free stand-in for a package like `adjustText`:
-# for each label, try a ring of candidate offsets around its point and use
-# the first one whose (rendered) bounding box doesn't overlap anything
-# already placed; fall back to the least-overlapping candidate. Best-effort,
-# not a guarantee - true only "if possible", as requested.
+# A dependency-free stand-in for `adjustText`: try a ring of offsets around each point and take the first
+# label box that overlaps nothing placed so far, else the least-overlapping one. Best-effort.
 
 
 def _get_renderer(fig):
@@ -77,61 +58,34 @@ def _place_label(
 ):
     """Place `text` near data point `(x, y)`, avoiding the display-coordinate boxes in `occupied`.
 
-    Tries `preferred_offset` (data units) first if given, then a ring of
-    candidate pixel offsets around the point; picks the first candidate
-    whose label box doesn't overlap anything in `occupied`, or the
-    least-overlapping one if none is fully clear. The chosen box is
-    appended to `occupied` in place, so later calls avoid it too.
-
-    Returns the created `matplotlib.text.Annotation`. If `renderer` is
-    `None` (couldn't be obtained for this backend), skips collision
-    avoidance and just places the label at `preferred_offset` (or the
-    point itself).
+    Tries `preferred_offset` (data units) first, then rings of pixel offsets; takes the first label box
+    that overlaps nothing in `occupied`, else the least-overlapping one, and appends it to `occupied`.
+    Without a `renderer` the label goes at `preferred_offset` (or the point) unchecked.
+    Returns the `matplotlib.text.Annotation`.
     """
     point_disp = ax.transData.transform((x, y))
-    arrowprops = {"arrowstyle": "->", "lw": 1.0, "color": color} if arrow else None
+    style = {
+        "textcoords": "data",
+        "fontsize": fontsize,
+        "color": color,
+        "fontweight": fontweight,
+        "ha": "center",
+        "va": "center",
+        "zorder": zorder,
+        "bbox": bbox_kwargs,
+    }
 
     def _measure(dx, dy):
-        # No `arrowprops` here: `Annotation.get_window_extent` includes the
-        # arrow's own bounding box (which reaches all the way back to the
-        # data point), not just the text glyph - measuring that would treat
-        # the arrow's sweep as occupied space and reject candidates for the
-        # wrong reason. The text-only box is what we actually want to keep
-        # labels clear of.
+        # Without the arrow: its window extent reaches back to the point and would count as occupied.
         cand = ax.transData.inverted().transform((point_disp[0] + dx, point_disp[1] + dy))
-        ann = ax.annotate(
-            text,
-            xy=(x, y),
-            xytext=cand,
-            textcoords="data",
-            fontsize=fontsize,
-            color=color,
-            fontweight=fontweight,
-            ha="center",
-            va="center",
-            zorder=zorder,
-            bbox=bbox_kwargs,
-        )
-        return cand, ann
+        return cand, ax.annotate(text, xy=(x, y), xytext=cand, **style)
 
     def _finalize(cand, ann):
-        if arrowprops is None:
+        if not arrow:
             return ann
         ann.remove()
-        return ax.annotate(
-            text,
-            xy=(x, y),
-            xytext=cand,
-            textcoords="data",
-            fontsize=fontsize,
-            color=color,
-            fontweight=fontweight,
-            ha="center",
-            va="center",
-            zorder=zorder,
-            bbox=bbox_kwargs,
-            arrowprops=arrowprops,
-        )
+        arrowprops = {"arrowstyle": "->", "lw": 1.0, "color": color}
+        return ax.annotate(text, xy=(x, y), xytext=cand, arrowprops=arrowprops, **style)
 
     if renderer is None:
         dx, dy = (
@@ -162,11 +116,7 @@ def _place_label(
                 best.remove()
             occupied.append(box)
             return _finalize(cand, ann)
-        # On ties, prefer the later (farther-explored) candidate over the
-        # first one seen: when several labels share nearly the same
-        # preferred position, the first-tried candidate is exactly the one
-        # most likely to collide with a sibling label placed just before it,
-        # so always settling on it would leave them stacked.
+        # On ties prefer the later candidate: labels sharing a preferred spot would otherwise stack.
         if best_score is None or score <= best_score:
             if best is not None:
                 best.remove()

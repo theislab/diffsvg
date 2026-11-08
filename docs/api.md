@@ -9,8 +9,12 @@
 .. autosummary::
     :toctree: generated
 
-    pp.basic_preproc
-    pp.elaborate_example
+    pp.bin_obs
+    pp.bin_counts
+    pp.BinnedData
+    pp.build_spline_basis
+    pp.compute_interior_knots
+    pp.spline_basis_at
 ```
 
 ## Tools
@@ -22,7 +26,16 @@
 .. autosummary::
     :toctree: generated
 
-    tl.basic_tool
+    tl.setup_model
+    tl.fit_model
+    tl.fit_profiles
+    tl.one_vs_rest
+    tl.cluster_curves
+    tl.check_stability
+    tl.parallel_curves_test
+    tl.shape_metric
+    tl.DiffSVGModelSetup
+    tl.StabilityResult
 ```
 
 ## Plotting
@@ -34,6 +47,9 @@
 .. autosummary::
     :toctree: generated
 
-    pl.basic_plot
-    pl.BasicClass
+    pl.plot_volcano
+    pl.plot_pvalue_histogram
+    pl.plot_prediction_curve
+    pl.plot_cluster_curves
+    pl.plot_stability
 ```
