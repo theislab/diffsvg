@@ -188,11 +188,6 @@ def test_data_start_runs_and_its_failure_is_flagged():
     assert stats["vi_khat"].iloc[0] > 0.7
 
 
-def test_unknown_slide_scale_method_is_rejected():
-    with pytest.raises(ValueError, match="slide_scales"):
-        dvg.tl.fit_model(None, None, inference="advi", slide_scales="joint")
-
-
 def test_slide_aware_fits_refuse_the_wald_test_and_profiles():
     adata = _slides(n_per_slide=100)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")

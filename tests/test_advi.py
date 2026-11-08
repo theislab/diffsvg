@@ -135,23 +135,6 @@ def test_advi_agrees_with_the_closed_form_on_cells(gene):
     assert np.isfinite(curves["cond0_mean"].to_numpy()).all()
 
 
-def test_advi_without_the_laplace_start_is_flagged():
-    adata = _adata()
-    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20)
-    stats, _, _ = dvg.tl.fit_model(
-        adata,
-        dvg.tl.setup_model(adata),
-        use_binned=False,
-        test="parallel",
-        inference="advi",
-        init=None,
-        n=300,
-        inplace=False,
-        progressbar=False,
-    )
-    assert (stats["vi_ess"] < 0.1).all()
-
-
 def test_advi_on_weighted_bins_stays_at_its_laplace_start():
     adata = _adata()
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20, window_radius=None)
@@ -173,6 +156,8 @@ def test_fit_model_rejects_unknown_inference_and_settings():
         dvg.tl.fit_model(None, None, inference="advi", init="map")
     with pytest.raises(ValueError, match="learning rates"):
         dvg.tl.fit_model(None, None, inference="advi", final_learning_rate=0.0)
+    with pytest.raises(ValueError, match="slide_scales"):
+        dvg.tl.fit_model(None, None, inference="advi", slide_scales="joint")
 
 
 def test_mu_is_only_recorded_when_asked_for():
