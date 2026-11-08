@@ -1,56 +1,12 @@
 """Per-gene GAM (P-spline) models for differential spatially/pseudotemporally variable genes.
 
-Preprocessing (binning `adata` along `anchor`/`condition`, assigning each
-cell to a bin, and stashing the result in ``adata.uns["binned"]``) lives in
-`diffsvg.pp.bin_obs`; this module only defines and fits models given that
-output. The public entry points here are `setup_model` and `fit_model`:
+`setup_model` reads the output of `diffsvg.pp.bin_obs` from ``adata.uns["binned"]``; `fit_model` fits one
+model per gene in parallel, predicts both condition curves on a fixed grid, tests them against each other
+and writes the result to ``adata.varm``.
 
-- `setup_model` reads ``adata.uns["binned"]`` (written by
-  `diffsvg.pp.bin_obs`), validates it against the requested `likelihood`,
-  and returns a `DiffSVGModelSetup` - a lightweight config, not a
-  collection of built models: with potentially thousands of genes, holding
-  a `pm.Model` per gene in memory at once is wasteful when every one of
-  them gets rebuilt from scratch per gene anyway (see below). It does no
-  binning itself and does not modify `adata`.
-- `fit_model` samples the posterior of every per-gene model - in parallel,
-  across worker processes - samples the posterior predictive on a fixed
-  grid for both levels of `condition`, tests the two curves against each
-  other (a tradeSeq-style functional Wald test, or the parallel-curves test
-  for slope/shape differences), and writes the result to `adata.varm`.
-
-Parallelization note
----------------------
-Every gene needs its *own* model, because it has its own target `Y`. Two
-tempting-but-broken ways to parallelize that:
-
-1. Build one model, fit it, then loop over genes calling
-   ``pm.set_data({"Y_data": next_gene}); pm.sample(...)`` on the *same*
-   compiled model - this is what a naive sequential version (and the
-   original draft of this module) does. Doing this **concurrently** from
-   multiple threads/processes against the same model is not safe: the
-   compiled sampler holds mutable/cached state, so one worker's
-   `pm.set_data` call can clobber the data another worker is mid-sample on.
-2. Build all `n_genes` models up front in the main process (so each gene
-   gets its own model, no set_data races) and hand each `pm.Model` to a
-   worker via `joblib`. This turns out to be broken for a different reason:
-   a `pm.Model` holds PyTensor graph nodes whose IPython ``_repr_latex_`` is
-   a `functools.partial`, which `cloudpickle` cannot serialize - so the
-   model object can never actually cross a process boundary once built
-   (verified: `joblib`/`loky` raises a `PicklingError` on it).
-
-The pattern used here avoids both: everything a per-gene model needs is
-either (a) shared, plain-numpy-array data that does not depend on the gene
-(the spline design matrices `B`/`B_masked`, the encoded `condition` column,
-...) or (b) a single per-gene vector (`Y`) plus a scalar
-(`intercept_initval`). `diffsvg.pp.bin_obs` computes both once, up front, in
-the main process. Neither `setup_model` nor `fit_model` ever build/hold a
-whole gene's worth of `pm.Model` objects at once - `fit_model` ships only
-that lightweight, pure-data payload to each worker; the worker then calls
-`_build_gene_model` to construct its **own private** model from scratch
-(cheap - graph construction, not sampling) and samples it. Every gene's
-model lives in its own process for its entire lifetime, so nothing is ever
-shared,
-swapped-in-place, or raced across workers.
+Parallelization: workers receive only plain arrays (the shared design matrices plus the gene's `Y`) and
+build their own `pm.Model` with `_build_gene_model`. A built model cannot be shipped instead (PyTensor
+graph nodes do not pickle), and reusing one compiled model via `pm.set_data` across workers would race.
 """
 
 import contextlib
@@ -67,21 +23,17 @@ import pytensor
 from joblib import Parallel, delayed
 from pymc.blocking import DictToArrayBijection, RaveledVars
 from scipy import optimize
-from scipy.sparse import issparse
 from scipy.special import logsumexp
 from scipy.stats import chi2, f, gamma, ncf, ncx2
 from tqdm.auto import tqdm
 
-from diffsvg.pp.utils import BinnedData, _bspline_basis_01, spline_basis_at
+from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
 
 # ============================================================
 # 1) Priors and likelihoods
 # ============================================================
-# Both are registries, so alternatives can be added without touching the
-# model builders. A prior is written as a tuple ``(distribution, *params)``,
-# with the parameters positional in the order listed below - a form that is
-# easy to vary in a grid (see `check_stability`) and that survives a trip
-# through `adata.uns`.
+# Registries, so alternatives can be added without touching the model builders. A prior is a tuple
+# ``(distribution, *params)``, parameters in the order listed below.
 
 _PRIOR_DISTRIBUTIONS = {
     "normal": (pm.Normal, ("mu", "sigma")),
@@ -92,8 +44,7 @@ _PRIOR_DISTRIBUTIONS = {
     "exponential": (pm.Exponential, ("lam",)),
 }
 
-#: The priors the models were hardcoded with before they became configurable,
-#: kept as the defaults so results do not move unless asked.
+#: Default priors; ``setup_model(priors=...)`` overrides any of them.
 DEFAULT_PRIORS = {
     "intercept": ("normal", 0.0, 1.0),
     "beta": ("normal", 0.0, 1.0),
@@ -107,12 +58,7 @@ DEFAULT_PRIORS = {
 
 
 def _resolve_priors(priors):
-    """Merge a partial prior spec over `DEFAULT_PRIORS` and validate it.
-
-    Partial on purpose: a sensitivity sweep usually varies one prior and
-    wants the rest left alone, so ``{"beta": ("normal", 0.0, 2.0)}`` is a
-    complete input.
-    """
+    """Merge a partial prior spec (e.g. ``{"beta": ("normal", 0.0, 2.0)}``) over `DEFAULT_PRIORS` and validate it."""
     merged = dict(DEFAULT_PRIORS)
     for name, spec in (priors or {}).items():
         if name not in DEFAULT_PRIORS:
@@ -173,25 +119,17 @@ _LIKELIHOODS = {
 class DiffSVGModelSetup:
     """Config bundle returned by `setup_model` and consumed by `fit_model`.
 
-    Deliberately holds no `pm.Model` objects - just enough configuration to
-    build one for any given gene. `fit_model` builds each gene's model on
-    the fly, per worker, right before sampling it (see the module
-    docstring), so materializing a whole gene panel's worth of models here
-    up front would just be extra memory held for no benefit; to inspect a
-    single gene's model structure (e.g. via `pm.model_to_graphviz`), call
-    `diffsvg.tl.model._build_gene_model` for that one gene directly instead.
+    Holds no `pm.Model`: `fit_model` builds each gene's model inside its worker. To inspect one gene's
+    model, call `_build_gene_model` directly.
 
     Attributes
     ----------
     binned
-        The `diffsvg.pp.utils.BinnedData` this setup was built from - holds
-        `Y`, the shared design matrices, and everything else that does not
-        depend on PyMC.
+        The `diffsvg.pp.utils.BinnedData` this setup was built from.
     likelihood
         Observation model every gene's model is built with.
     priors
-        Fully resolved prior spec (see `DEFAULT_PRIORS`), i.e. whatever was
-        passed to `setup_model` merged over the defaults.
+        Prior spec passed to `setup_model`, merged over `DEFAULT_PRIORS`.
     """
 
     binned: BinnedData
@@ -220,31 +158,18 @@ def _build_gene_model(
 ):
     """Build the P-spline GAM for a single gene.
 
-    `B`/`B_masked`/`condition_arr` (shared across genes, see `setup_model`)
-    only depend on `anchor`/`condition`; only `Y` (the binned expression)
-    and `intercept_initval` change per gene. Building this is cheap (graph
-    construction only, no compilation/sampling), so it is safe - and
-    intentional - to call it again inside each worker in `fit_model` instead
-    of trying to reuse a model built elsewhere.
+    `B`/`B_masked`/`condition_arr` are shared across genes; only `Y` and `intercept_initval` change per
+    gene. Building is cheap (graph construction only), so every worker builds its own.
 
-    `weights` (cells per row) and `ss_within` (``(within-row sum of squares,
-    n_cells - n_rows)``) come from contiguous bins (`BinnedData.weighted`):
-    rows are then weighted by their cell count and the noise is the
-    cell-level one, as in a fit on the cells. `weights` lives in a
-    ``"w_data"`` container so predictions can set it per grid point.
-
-    `record_mu` keeps the row-wise mean in the trace (as the ``"mu"``
-    deterministic). That is one value per row and draw, so the variational
-    fit, which takes thousands of draws, leaves it out on single cells.
-
-    `sample_index` (the slide of every row, ``0..n_samples-1``) adds a random
-    level and a random curve per slide, non-centred: ``sample_level_sd *
-    z_level[slide] + B @ (sample_curve_sd * z_curve[slide])``. The curve
-    coefficients share one scale, as in the Stage 0 prototype. Both terms are
-    multiplied by a ``"sample_on"`` container (1 on the fitted rows), so a
-    prediction grid sets it to 0 and gets the population-level curves.
-    `sample_scales` ``(level_sd, curve_sd)`` fixes the two scales instead of
-    giving them priors (empirical Bayes, see `_empirical_bayes_scales`).
+    - `weights` (cells per row) and `ss_within` (``(within-row sum of squares, n_cells - n_rows)``) come
+      from contiguous bins: rows are weighted by their cell count and the noise is the cell-level one.
+      `weights` lives in a ``"w_data"`` container so predictions can set it per grid point.
+    - `record_mu` keeps the row-wise mean as the ``"mu"`` deterministic (one value per row and draw, so
+      ADVI leaves it out).
+    - `sample_index` (the slide of every row) adds a non-centred random level and random curve per slide,
+      ``sample_level_sd * z_level[slide] + B @ (sample_curve_sd * z_curve[slide])``, multiplied by a
+      ``"sample_on"`` container that a prediction grid sets to 0 for the population-level curves.
+      `sample_scales` ``(level_sd, curve_sd)`` fixes the two scales instead (empirical Bayes).
     """
     if likelihood not in _LIKELIHOODS:
         raise ValueError(f"Unknown likelihood {likelihood!r}. Available: {sorted(_LIKELIHOODS)}")
@@ -291,16 +216,7 @@ def _build_gene_model(
 def _build_profile_model(
     Y, B, n_bsplines, intercept_initval, likelihood="normal", priors=None, weights=None, ss_within=None
 ):
-    """Build the condition-free P-spline GAM for a single gene.
-
-    Same priors, spline basis and likelihood as `_build_gene_model`, minus
-    the `condition` covariate and its interaction with the spline: with no
-    conditions there is nothing for them to encode, and the Wald test on the
-    interaction coefficient does not apply either (see `one_vs_rest`, which
-    ranks on the curve distance instead). Kept as its own builder rather
-    than branching inside `_build_gene_model`, so each model reads as one
-    straight-line definition.
-    """
+    """`_build_gene_model` without the `condition` covariate and its spline interaction (for `fit_profiles`)."""
     if likelihood not in _LIKELIHOODS:
         raise ValueError(f"Unknown likelihood {likelihood!r}. Available: {sorted(_LIKELIHOODS)}")
     likelihood_fn = _LIKELIHOODS[likelihood]
@@ -363,12 +279,7 @@ def setup_model(adata, likelihood="normal", priors=None):
 
 @dataclass
 class _FitShared:
-    """The plain-array payload shared by every gene, shipped once per task.
-
-    Deliberately holds no PyMC/PyTensor objects (see the module docstring) -
-    everything here pickles as ordinary numpy arrays, so there is nothing
-    for concurrent workers to race on or overwrite.
-    """
+    """The plain-array payload shared by every gene (no PyMC objects, see the module docstring)."""
 
     B: np.ndarray
     B_masked: np.ndarray
@@ -444,15 +355,9 @@ def _sample_inputs(adata, binned, use_binned):
 def _fit_inputs(adata, binned, use_binned):
     """The targets and design matrices to fit on: the binned aggregates, or one row per cell.
 
-    ``use_binned=True`` hands back exactly what `diffsvg.pp.bin_obs`
-    precomputed. ``use_binned=False`` rebuilds the same quantities at cell
-    resolution - the *same* basis (knots, boundary knots and centring, via
-    `diffsvg.pp.spline_basis_at`) and condition encoding, so the two stay
-    comparable and the fitted coefficients are valid on the prediction grid -
-    and reads `Y` straight from `adata` rather than duplicating the
-    expression matrix into ``adata.uns``. Cells without an anchor value (e.g.
-    the anchor cells themselves) or without a condition are left out, as the
-    binning leaves them out too.
+    For cells, the basis is the binned one evaluated per cell (`diffsvg.pp.spline_basis_at`), so the
+    coefficients stay valid on the prediction grid, and `Y` is read from `adata`. Cells without an anchor
+    value or a condition are left out, as in the binning.
 
     Returns ``(B, B_masked, condition_fit, Y, intercept_initvals)``.
     """
@@ -478,14 +383,9 @@ def _fit_inputs(adata, binned, use_binned):
             )
         B_masked = B * condition_fit[:, None]
 
-    sub = adata[:, binned.genes]
-    X = sub.layers[binned.layer] if binned.layer is not None else sub.X
-    X = X.toarray() if issparse(X) else np.asarray(X)
-    X = np.asarray(X, dtype=float)[keep]
-
+    X = _expression(adata, binned.genes, binned.layer)[keep]
     Y = {gene: X[:, i] for i, gene in enumerate(binned.genes)}
-    # Same intent as the binned initval (mean expression at the anchor
-    # origin), but no cell sits exactly at 0, so the first bin stands in.
+    # As for bins (mean expression at anchor 0), but no cell sits exactly at 0, so the first bin stands in.
     first_bin = np.asarray(binned.bin_assignment)[keep] == 0
     intercept_initvals = {
         gene: float(y[first_bin].mean()) if first_bin.any() else float(y.mean()) for gene, y in Y.items()
@@ -527,18 +427,8 @@ def _predictive_seeds(seed, n_genes, per_gene):
 def _quiet_fds():
     """Redirect the OS-level stdout/stderr file descriptors to `os.devnull`.
 
-    `contextlib.redirect_stdout`/`redirect_stderr` only swap the Python
-    `sys.stdout`/`sys.stderr` objects, which misses writes from compiled
-    extensions that write straight to the process's file descriptors -
-    `nutpie`'s sampler is a Rust extension, so it could. This redirects the
-    actual fds instead, so it catches those too.
-
-    Safe to wrap around code that might raise: a raised exception is a
-    Python object that propagates through the normal call stack (and, here,
-    through `joblib`) regardless of what stdout/stderr are pointed at: it
-    is not lost, and by the time anything prints it (e.g. `joblib` re-
-    raising in the main process), the `finally` below has already restored
-    the real fds.
+    Unlike `contextlib.redirect_stdout`, this also catches compiled extensions (nutpie's Rust sampler)
+    writing straight to the fds. Exceptions still propagate; the fds are restored before anything prints them.
     """
     saved = [os.dup(fd) for fd in (1, 2)]
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -555,15 +445,9 @@ def _quiet_fds():
 
 @contextlib.contextmanager
 def _quiet_pymc():
-    """Silence PyMC/PyTensor/nutpie's sampler announcements, warnings, and any raw fd output.
+    """Silence PyMC/PyTensor/nutpie's logging, warnings and raw fd output in the process that samples.
 
-    Scoped tightly around the actual `pm.sample`/`pm.sample_posterior_predictive`
-    calls in `_fit_and_predict_gene`, i.e. this runs inside whichever
-    process actually samples (the main process for `n_workers=1`, a worker
-    process otherwise - see the module docstring on why it has to be here
-    rather than configured once up front in `fit_model`). The outer `tqdm`
-    progress bar over completed genes lives in the parent process and
-    writes to stderr there, so it is unaffected either way.
+    Runs inside each worker; the outer `tqdm` bar lives in the parent process and is unaffected.
     """
     loggers = [logging.getLogger(name) for name in ("pymc", "pytensor", "nutpie")]
     previous_levels = [logger.level for logger in loggers]
@@ -581,34 +465,25 @@ def _quiet_pymc():
 # ------------------------------------------------------------
 # Posterior inference: NUTS, or full-rank ADVI
 # ------------------------------------------------------------
-# `fit_model(..., inference=...)` picks one of the functions in `_INFERENCE`. Each runs inside ``with model``
-# and returns the posterior as an `InferenceData` plus a dict of diagnostic columns for the stats table.
+# `fit_model(..., inference=...)` picks one of `_INFERENCE`. Each runs inside ``with model`` and returns the
+# posterior as `InferenceData` plus a dict of diagnostic columns.
 #
-# The variational fit does not call `pm.fit` plainly because that does not get there on single cells. The spline
-# coefficients have a long, thin posterior - standard deviations from ~1e-2 along the directions the data fix to
-# ~0.3 along the ones they do not, tilted against the coordinates - and ADVI started from a unit Gaussian has to
-# shrink into it by stochastic gradients. On legnini genes (41k cells), PyMC's default optimiser is still far
-# away after 10k steps, 30k steps of Adam leave the covariance of the shape directions 1.3-12x too wide, and
-# mean-field cannot tilt at all (up to 70x off). The shape test is built on exactly that covariance, so the family
-# is full-rank and starts at the Laplace approximation (mode and inverse Hessian on the unconstrained scale), which
-# is already close with this many rows; ADVI then only polishes it. See .claude/advi_plan.md.
+# ADVI is full-rank and starts at the Laplace approximation (mode and inverse Hessian on the unconstrained scale):
+# the spline coefficients have a long, thin, tilted posterior that plain `pm.fit` from a unit Gaussian does not
+# reach on single cells, and mean-field cannot represent it. The shape test is built on that covariance.
+# See .claude/advi_plan.md.
 
 #: Settings of ``inference="advi"``, overridable through `fit_model`'s `sample_kwargs`.
 #:
 #: - ``n``: Adam steps after the Laplace start (0 returns the Laplace approximation itself).
-#: - ``learning_rate``, ``final_learning_rate``: the step size, decayed exponentially between the two over ``n``.
-#:   The Laplace start sits within a few percent of the optimum, so large steps only add noise: the posterior is
-#:   ~1e-2 wide in its narrow directions and Adam moves every parameter by about the learning rate per step.
+#: - ``learning_rate``, ``final_learning_rate``: decayed exponentially over ``n``; small, since the start is close.
 #: - ``obj_n_mc``: Monte Carlo samples per gradient.
-#: - ``draws``: draws from the fitted approximation, which the curves and the shape test are computed from.
-#: - ``init``: ``"laplace"``, or ``None`` for PyMC's own start (a unit Gaussian; not recommended, see above).
+#: - ``draws``: draws from the fitted approximation.
+#: - ``init``: ``"laplace"``, or ``None`` for PyMC's unit-Gaussian start (not recommended).
 #: - ``diagnostic_draws``: draws for the importance-ratio diagnostics (0 skips them).
 #: - ``random_seed``.
-#: - ``slide_scales``: only for data binned with `sample`, how the two slide scales (``sample_level_sd``,
-#:   ``sample_curve_sd``) are handled, since a Laplace start at their joint mode with the slide effects is far off
-#:   (see the comment above `_empirical_bayes_scales`): ``"empirical_bayes"`` fixes them at the mode of their
-#:   Laplace-approximated marginal posterior, ``"data_start"`` keeps them random and starts ADVI at a rough
-#:   least-squares guess (see `_guess_slide_scales`).
+#: - ``slide_scales``: only with `sample`: ``"empirical_bayes"`` (see `_empirical_bayes_scales`) or
+#:   ``"data_start"`` (scales stay random, started at `_guess_slide_scales`).
 _VI_DEFAULTS = {
     "n": 2000,
     "learning_rate": 1e-3,
@@ -800,17 +675,12 @@ def _importance_diagnostics(density, mean, cov, n_draws, seed):
 # ------------------------------------------------------------
 # Slides with ADVI
 # ------------------------------------------------------------
-# With `bin_obs(sample=...)` the slide effects are non-centred, ``scale * z`` with ``z ~ N(0, 1)``, and the joint
-# mode of (z, log scale) - where the plain Laplace start would sit - is not where the posterior is: shrinking z and
-# growing the scale costs little, so the mode follows the size of the slide effects and the prior (scales 1.3 / 2.3
-# on simulated slides whose posterior is at 0.40 / 0.55; ADVI then reports W 0.15 instead of NUTS's 4.6). Two ways
-# around it, chosen with the ``slide_scales`` setting:
-# - "empirical_bayes": fix the scales at the mode of their marginal posterior, the slide effects integrated out by a
-#   Laplace approximation (as lme4/TMB do for GLMMs). Given the scales the posterior of everything else is close to
-#   Gaussian, so the usual Laplace start + ADVI applies; the F reference of the test allows for the plugged-in scales.
-# - "data_start": keep the scales random, start ADVI at a least-squares guess of them and let it move them.
-# For the Normal likelihood the slide effects could also be integrated out exactly (given sigma the model is a linear
-# mixed model). Not done: ADVI is meant for likelihoods where that is not possible.
+# With `bin_obs(sample=...)` the slide effects are non-centred (``scale * z``), and the joint mode of
+# (z, log scale), where a plain Laplace start would sit, is far from the posterior (simulated slides: scales
+# 1.3 / 2.3 vs 0.40 / 0.55, W 0.15 vs NUTS's 4.6). The ``slide_scales`` setting picks the way around it:
+# - "empirical_bayes": fix the scales at the mode of their marginal posterior, slide effects integrated out by a
+#   Laplace approximation (as lme4/TMB do), then the usual Laplace start + ADVI.
+# - "data_start": keep the scales random and start ADVI at a least-squares guess of them.
 
 #: The slide scales (value variables) and the standard-normal slide effects each one multiplies.
 _SLIDE_SCALES = {"sample_level_sd_log__": "sample_level_z", "sample_curve_sd_log__": "sample_curve_z"}
@@ -829,30 +699,25 @@ def _blocks(density):
 
 
 def _guess_slide_scales(y, B, condition, sample_index, n_samples, weights=None, ridge=1e-3):
-    """Rough slide scales by least squares, as a starting point.
+    """Rough slide scales by least squares, as a starting point (assumes the Normal likelihood).
 
-    Fits the pooled model, then each slide's residuals with a level and a
-    spline curve, and returns the root mean square of those levels and of
-    those curve coefficients. The noise in each slide's fit biases them
-    upwards, which a starting point can afford. Works on the data's own
-    scale, i.e. assumes the Normal likelihood.
+    Fits the pooled model, then each slide's residuals with a level and a spline curve, and returns the
+    RMS of those levels and of those curve coefficients (biased upwards by noise, fine for a start).
     """
     y = np.asarray(y, dtype=float)
     w = np.ones(len(y)) if weights is None else np.asarray(weights, dtype=float)
 
-    def solve(X, target):
+    def solve(X, target, w_rows):
         return np.linalg.solve(
             (X * w_rows[:, None]).T @ X + ridge * np.eye(X.shape[1]), (X * w_rows[:, None]).T @ target
         )
 
     X = np.column_stack([np.ones(len(y)), B, condition, B * condition[:, None]])
-    w_rows = w
-    residual = y - X @ solve(X, y)
+    residual = y - X @ solve(X, y, w)
     levels, curves = [], []
     for j in range(n_samples):
         rows = np.asarray(sample_index) == j
-        w_rows = w[rows]
-        coef = solve(np.column_stack([np.ones(rows.sum()), B[rows]]), residual[rows])
+        coef = solve(np.column_stack([np.ones(rows.sum()), B[rows]]), residual[rows], w[rows])
         levels.append(coef[0])
         curves.append(coef[1:])
     return (
@@ -1051,22 +916,12 @@ _INFERENCE = {
 
 
 def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None, seeds=(None, None)):
-    """Build + sample one gene's own private model, then its posterior predictive at both condition levels.
+    """Build and fit one gene's model in this worker, then predict both condition curves on the grid.
 
-    Runs inside a worker process. The model is built fresh, right here, from
-    plain arrays (`Y`, `shared`) - it is never received pre-built from the
-    main process, so there is no compiled model/cache shared with any other
-    worker to race on. Returns ``(gene, stats_row, curve_row)`` where
-    `stats_row` is a flat dict (the columns of the test in ``shared.test``,
-    then the ones every test shares) and `curve_row` is a dict of 1D arrays
-    (each of length ``len(shared.B_pred)``): the ``condition==1`` minus
-    ``condition==0`` curve (``"delta"``), and, per condition, the posterior
-    mean curve and a 94% equal-tailed credible band (``"cond{0,1}_mean"``,
-    ``"cond{0,1}_ci_low"``, ``"cond{0,1}_ci_high"``), plus the posterior means
-    of the spline coefficients (``"beta"``, ``"beta_1"``, of length
-    ``shared.n_bsplines``, not on the grid). `ss_within` is this
-    gene's within-row term for weighted bins (see `_weighting`), `seeds` the
-    posterior-predictive seeds for the two condition levels.
+    Returns ``(gene, stats_row, curve_row)``: `stats_row` holds the test's columns and the shared ones;
+    `curve_row` holds the mean difference curve ``"delta"``, per condition the mean curve and its 94% band
+    (``"cond{0,1}_{mean,ci_low,ci_high}"``) and the posterior means of ``"beta"`` and ``"beta_1"``.
+    `ss_within` is the gene's within-row term (see `_weighting`), `seeds` the predictive seeds per condition.
     """
 
     def build(sample_scales=None):
@@ -1091,10 +946,6 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
     n_grid = shared.B_pred.shape[0]
     slides = shared.sample_index is not None
 
-    # Everything below is wrapped in `_quiet_pymc()` (not just `pm.sample`
-    # itself): `pm.sample_posterior_predictive` and `az.rhat`/`az.ess` can
-    # each emit their own logging/warnings too, and the goal here is a
-    # clean run with only the outer progress bar and real errors visible.
     with _quiet_pymc():
         if slides and shared.inference == "advi":  # builds its own models, so outside any model context
             guess = _guess_slide_scales(
@@ -1144,11 +995,7 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
             cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
             integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
 
-            # Computed directly from the posterior (rather than via `az.summary`'s
-            # column names, e.g. "hdi_3%"), since those have changed across arviz
-            # versions; the MCMC convergence diagnostics (see `_sample_nuts`) use
-            # `az.rhat`/`az.ess`, whose variable -> array mapping (`.data_vars`)
-            # has stayed stable.
+            # From the posterior directly: `az.summary`'s column names change across arviz versions.
             post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
             ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
             beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
@@ -1178,13 +1025,7 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
 
 
 def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None, seeds=(None,)):
-    """Build + sample one gene's condition-free model, then its single posterior predictive curve.
-
-    The `_fit_and_predict_gene` counterpart for data without conditions: one
-    curve per gene instead of one per condition, so there is no delta and no
-    differential statistic here - `one_vs_rest` derives those by comparing
-    genes against each other. Returns ``(gene, diag_row, curve_row)``.
-    """
+    """`_fit_and_predict_gene` for the condition-free model: one curve, no test. Returns ``(gene, diag_row, curve_row)``."""
     model = _build_profile_model(
         Y,
         shared.B,
@@ -1198,7 +1039,7 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
     n_grid = shared.B_pred.shape[0]
 
     with model, _quiet_pymc():
-        idata = pm.sample(**sample_kwargs)
+        idata, diag_columns = _sample_nuts(model, sample_kwargs, ["intercept", "beta", "sigma"])
 
         grid_data = {"B_data": shared.B_pred, "Y_data": np.zeros(n_grid)}
         if shared.weights is not None:
@@ -1213,14 +1054,7 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
         ci_low, ci_high = np.quantile(draws, [0.03, 0.97], axis=0)
         beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
 
-        diag_vars = ["intercept", "beta", "sigma"]
-        n_divergent = int(idata.sample_stats["diverging"].sum()) if "diverging" in idata.sample_stats else 0
-        rhat_ds = az.rhat(idata, var_names=diag_vars)
-        ess_ds = az.ess(idata, var_names=diag_vars, method="bulk")
-        rhat_max = float(max(np.asarray(rhat_ds[v]).max() for v in rhat_ds.data_vars))
-        ess_bulk_min = float(min(np.asarray(ess_ds[v]).min() for v in ess_ds.data_vars))
-
-    diag_row = {"gene": gene, "n_divergent": n_divergent, "rhat_max": rhat_max, "ess_bulk_min": ess_bulk_min}
+    diag_row = {"gene": gene, **diag_columns}
     curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high, "beta": beta_mean}
     return gene, diag_row, curve_row
 
@@ -1883,126 +1717,47 @@ def one_vs_rest(
 
 
 # ============================================================
-# 4) Standalone statistics helpers
+# 4) Statistics helpers
 # ============================================================
-# (Used internally by `_fit_and_predict_gene`/`fit_model`, and kept public
-# for anyone who wants to run the tradeSeq-style comparison on
-# posterior-predictive curves, or the parallel-curves test on `beta_1`
-# draws, obtained some other way.)
-
-
-def wald_test(beta, cov, contrast=None):
-    """
-    Multivariate Wald test.
-
-    Parameters
-    ----------
-    beta : array-like, shape (p,)
-        Coefficient estimates.
-
-    cov : array-like, shape (p, p)
-        Covariance matrix of coefficient estimates.
-
-    contrast : array-like, optional
-        Contrast matrix C for testing:
-            H0: C beta = 0
-
-        If None:
-            C = identity matrix
-
-    Returns
-    -------
-    stat : float
-        Wald chi-square statistic.
-
-    df : int
-        Degrees of freedom.
-
-    pval : float
-        Chi-square p-value.
-    """
-    beta = np.asarray(beta)
-    cov = np.asarray(cov)
-
-    if contrast is None:
-        Cbeta = beta
-        Ccov = cov
-    else:
-        C = np.asarray(contrast)
-        Cbeta = C @ beta
-        Ccov = C @ cov @ C.T
-
-    # numerically stable inverse
-    stat = float(Cbeta.T @ np.linalg.solve(Ccov, Cbeta))
-
-    df = len(Cbeta)
-
-    pval = chi2.sf(stat, df)
-
-    return stat, df, pval
 
 
 def pattern_wald_test(pred0, pred1, ridge=1e-6):
-    """
-    tradeSeq-like functional Wald test on posterior predictive curves.
+    """tradeSeq-like functional Wald test on posterior-predictive curves.
 
     Parameters
     ----------
-    pred0 : array, shape (n_draws, M)
-        Posterior predictive samples for condition 0
-
-    pred1 : array, shape (n_draws, M)
-        Posterior predictive samples for condition 1
-
+    pred0, pred1 : array, shape (n_draws, M)
+        Posterior-predictive draws of the two condition curves.
     ridge : float
-        Small diagonal regularization for covariance stability
+        Diagonal regularization of the covariance.
 
     Returns
     -------
     stat : float
-        Wald statistic
-
+        Wald statistic.
     pval : float
-        Chi-square p-value
-
+        Chi-square p-value.
     df : int
-        Effective degrees of freedom (= rank of covariance)
-
+        Effective degrees of freedom (rank of the covariance).
     delta_mean : array
-        Mean curve difference
+        Mean difference curve ``pred1 - pred0``.
     """
-    # posterior samples of curve differences
     delta = pred1 - pred0  # (draws, M)
+    mu = delta.mean(axis=0)
 
-    # posterior mean difference
-    mu = delta.mean(axis=0)  # (M,)
-
-    # covariance of contrasts
     Sigma = np.cov(delta, rowvar=False)
-    # stabilize
     Sigma += ridge * np.eye(Sigma.shape[0])
 
-    # eigendecomposition (same idea as tradeSeq)
+    # pseudoinverse over the non-singular directions, as in tradeSeq
     eigvals, eigvecs = np.linalg.eigh(Sigma)
-
-    # remove near-singular directions
     keep = eigvals > 1e-8
-
     eigvals = eigvals[keep]
     eigvecs = eigvecs[:, keep]
-
-    # pseudoinverse
     Sigma_inv = eigvecs @ np.diag(1.0 / eigvals) @ eigvecs.T
 
-    # Wald statistic
     W = mu.T @ Sigma_inv @ mu
-
-    # effective df
     df = keep.sum()
-
-    # asymptotic p-value
     pval = 1.0 - chi2.cdf(W, df)
-
     return W, pval, df, mu
 
 
@@ -2141,58 +1896,6 @@ def parallel_curves_test(beta_1, metric, tau=0.1, cov=None, df_denominator=None)
     return float(np.sqrt(z @ z)), stat, df, pval
 
 
-def zscore_curve(x):
-    """Z-score a 1D prediction curve.
-
-    Removes mean and scale -> shape-only comparison.
-    """
-    x = np.asarray(x)
-
-    mu = np.mean(x)
-    sd = np.std(x)
-
-    return (x - mu) / (sd + 1e-8)
-
-
 def compute_T(curve0, curve1):
     """Functional L2 distance between two curves."""
     return np.mean((curve1 - curve0) ** 2)
-
-
-def compute_shape_statistics(pred_dict, null_quantile=0.9):
-    """Compute the tradeSeq-style shape statistic and null p-values for a set of gene curve pairs.
-
-    Parameters
-    ----------
-    pred_dict : dict
-
-        Format:
-        {
-            gene_name: (pred_cond0, pred_cond1)
-        }
-
-        where each prediction array is 1D:
-        shape = (n_bins,)
-
-    null_quantile : float
-        Lower-tail fraction used for empirical null estimation.
-
-    Returns
-    -------
-    results_df : pd.DataFrame
-    """
-    genes = list(pred_dict.keys())
-    T_values = np.array([compute_T(pred0, pred1) for pred0, pred1 in pred_dict.values()])
-
-    empirical_pvals, gamma_pvals = _compute_null_pvalues(T_values, null_quantile=null_quantile)
-
-    results_df = pd.DataFrame(
-        {
-            "gene": genes,
-            "T": T_values,
-            "empirical_pval": empirical_pvals,
-            "gamma_pval": gamma_pvals,
-        }
-    )
-
-    return results_df.sort_values("T", ascending=False).reset_index(drop=True)

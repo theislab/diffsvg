@@ -1,21 +1,8 @@
 """Grid search over preprocessing/model options, to see how stable the gene ranking is.
 
-`check_stability` re-runs the whole pipeline once per parameter combination
-and compares the resulting gene rankings. Three things shape the design:
-
-- **Cost.** Every configuration is a full MCMC fit of every gene, so the
-  grid multiplies out fast. Configurations are grouped by their *binning*
-  signature and re-binned once per group (priors, `likelihood` and
-  `use_binned` only need a refit), and only a subsample of genes is used by
-  default.
-- **What to rank on.** The empirical/Gamma p-values are computed against the
-  panel, so subsampling moves them and they are not comparable across runs.
-  The ranking statistic (`wald_stat`, `T`, ...) is, which is why that is
-  what gets ranked.
-- **A noise floor.** The baseline configuration is re-run under a different
-  `random_seed`, and the agreement between those two runs bounds how much
-  agreement means anything: a configuration that scores within the floor is
-  indistinguishable from MCMC jitter rather than genuinely stable.
+`check_stability` re-runs the pipeline per parameter combination (re-binning once per binning signature,
+on a gene subsample), ranks on a statistic rather than the panel-dependent p-values, and re-runs the
+baseline under other seeds to get a noise floor for the agreement.
 """
 
 import inspect
@@ -30,8 +17,7 @@ from diffsvg.pp.utils import bin_obs
 
 from .model import DiffSVGModelSetup, fit_model, setup_model
 
-#: Parameters that change the binning, so a configuration that varies one of
-#: these needs `bin_obs` re-run; everything else only needs a refit.
+#: Parameters that need `bin_obs` re-run; the others only need a refit.
 _BIN_PARAMS = ("n_bsplines", "degree", "n_bins", "window_radius", "layer")
 _MODEL_PARAMS = ("likelihood", "priors", "use_binned")
 

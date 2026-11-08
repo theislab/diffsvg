@@ -8,6 +8,14 @@ import patsy
 from scipy.sparse import issparse
 
 
+def _expression(adata, genes, layer):
+    """Dense float ``(n_obs, n_genes)`` expression of `genes`, from ``adata.layers[layer]`` or ``adata.X``."""
+    sub = adata[:, genes]
+    X = sub.layers[layer] if layer is not None else sub.X
+    X = X.toarray() if issparse(X) else np.asarray(X)
+    return np.asarray(X, dtype=float)
+
+
 def _nearest_bin(values, n_bins):
     """Index of the nearest of the ``n_bins + 1`` grid centres for every value; ``-1`` where it is missing."""
     values = np.asarray(values, dtype=float)
@@ -30,48 +38,32 @@ def bin_counts(
 ):
     """Average expression of one or more genes in windows along `anchor`, per `category` level.
 
-    The `anchor` coordinate is assumed to live on ``[0, 1]`` (e.g. a normalized
-    pseudotime or spatial distance stored in ``adata.obsm["design_matrix"]``).
-    For a fixed grid of `n_bins` + 1 centers, all cells within `window_radius`
-    of a center are averaged, separately for every level of `category`; with
-    ``window_radius=None`` every cell goes to its nearest center only. Because
-    the grid, the windows, and the category assignment do not depend on the
-    gene, this is computed once for all requested `genes` at the same time
-    rather than looping per gene.
+    For a grid of `n_bins` + 1 centers on ``[0, 1]``, all cells within `window_radius` of a center are
+    averaged, separately for every level of `category`. The grid does not depend on the gene, so all
+    `genes` are binned at once.
 
     Parameters
     ----------
     adata
         Annotated data matrix.
     genes
-        Gene name(s) (subset of ``adata.var_names``) to bin.
+        Gene name(s) to bin.
     anchor
-        Column in `design_matrix` holding the ordering coordinate, expected to
-        be in ``[0, 1]``.
+        Column in `design_matrix` holding the ordering coordinate, in ``[0, 1]``.
     category
-        Column in `design_matrix` used to stratify the binning (e.g. a
-        condition indicator). Also used as the column name for the category
-        value in the returned per-gene data frames. `None` bins along
-        `anchor` only, as a single group.
+        Column in `design_matrix` to stratify by (e.g. the condition), also the column name in the output.
+        `None` bins along `anchor` only, as a single group.
     design_matrix
-        ``adata.obsm`` key of a data frame aligned to ``adata.obs_names``
-        holding at least `anchor` and `category`. Defaults to
-        ``"design_matrix"``, i.e. ``adata.obsm["design_matrix"]``.
+        ``adata.obsm`` key of a data frame holding `anchor` and `category`.
     n_bins
-        Number of bins spanning ``[0, 1]``; the grid has `n_bins` + 1 centers
-        (``np.linspace(0, 1, n_bins + 1)``).
+        Number of bins spanning ``[0, 1]``; the grid has `n_bins` + 1 centers.
     window_radius
-        Half-width of the averaging window around each bin center. Windows
-        wider than half the bin spacing (``0.5 / n_bins``) overlap, so a cell
-        is averaged into several bins. `None` makes the windows contiguous
-        and non-overlapping: each cell counts once, in the bin of its nearest
-        center.
+        Half-width of the averaging window. Windows wider than ``0.5 / n_bins`` overlap. `None` makes them
+        contiguous: each cell counts once, in the bin of its nearest center.
     layer
         If given, bin ``adata.layers[layer]`` instead of ``adata.X``.
     drop_empty_bins
-        Drop ``(category, bin)`` combinations with zero observations. Since
-        emptiness only depends on `anchor`/`category`, it is shared by all
-        genes, so it is safe to drop these rows once for every gene.
+        Drop ``(category, bin)`` rows without cells (the same rows for every gene).
 
     Returns
     -------
@@ -84,15 +76,10 @@ def bin_counts(
     design_matrix = adata.obsm[design_matrix]
 
     genes = [genes] if isinstance(genes, str) else list(genes)
-
-    sub = adata[:, genes]
-    X = sub.layers[layer] if layer is not None else sub.X
-    X = X.toarray() if issparse(X) else np.asarray(X)
-    X = np.asarray(X, dtype=float)  # (n_obs, n_genes)
+    X = _expression(adata, genes, layer)
 
     value = design_matrix[anchor].values
-    # `category=None` bins along `anchor` alone, as one group - used for the
-    # condition-free models behind `diffsvg.tl.one_vs_rest`.
+    # `category=None` bins along `anchor` alone, as one group.
     cat = np.zeros(len(value)) if category is None else np.asarray(design_matrix[category].values)
 
     bin_centers = np.linspace(0, 1, n_bins + 1)
@@ -245,59 +232,40 @@ def spline_basis_at(binned, x):
 class BinnedData:
     """Output of `bin_obs`, consumed by `diffsvg.tl.setup_model`.
 
-    Holds everything needed to build a per-gene GAM that does *not* depend
-    on the gene (the spline design matrices, the encoded `condition`
-    column, the prediction grid, ...), plus the one thing that does: `Y`.
+    Everything a per-gene GAM needs that does not depend on the gene, plus the binned targets `Y`.
 
     Attributes
     ----------
     genes
         Gene order matching `Y`/`intercept_initvals`.
     Y
-        Per-gene binned expression (target `Y` of the GAM).
+        Per-gene binned expression.
     intercept_initvals
-        Per-gene initial value for the GAM's `intercept` parameter (mean
-        binned expression at ``anchor == 0``).
+        Per-gene initial value of `intercept` (mean binned expression at ``anchor == 0``).
     anchor, condition
-        Column names in ``adata.obsm["design_matrix"]`` the data was binned
-        on. `condition` is `None` when binned without one, in which case
-        every condition-dependent field below is `None` too and only the
-        condition-free models (see `diffsvg.tl.fit_profiles`) can be fit.
+        Columns of the design matrix the data was binned on. `condition` is `None` when binned without
+        one; every condition-dependent field is then `None` too.
     condition_categories
-        Mapping ``{"0": <original label>, "1": <original label>}`` recording
-        how `condition` was encoded to ``0.0``/``1.0`` (string keys so this
-        survives round-tripping through ``adata.uns`` / h5ad, whose `dict`
-        writer requires string keys).
+        ``{"0": <label>, "1": <label>}``, how `condition` was encoded (string keys for h5ad).
     n_bsplines, degree, n_bins
-        Binning/basis hyperparameters used by `bin_obs`.
+        Binning/basis hyperparameters.
     B, B_masked, condition_fit
-        Spline design matrices / encoded condition at fit time (shared
-        across all genes - only `Y` differs per gene).
+        Spline design matrices and encoded condition of the fitted rows.
     bin_centers
-        Grid (`n_bins` + 1 points on ``[0, 1]``), also used as the posterior
-        predictive prediction grid.
+        Grid (`n_bins` + 1 points on ``[0, 1]``), also the prediction grid.
     bin_assignment
-        Per-cell (i.e. per ``adata.obs_names``) index into `bin_centers` -
-        which bin each cell was assigned to, by nearest `anchor` value, or
-        ``-1`` for cells without one. Also written to
-        ``adata.obs[f"{anchor}_bin"]`` by `bin_obs`.
+        Per cell, the index of its nearest bin center, ``-1`` without an anchor value.
     design_matrix, layer
-        Where the unbinned data lives, so the fitters can rebuild the
-        per-cell design matrices for ``use_binned=False``.
+        Where the unbinned data lives, for ``use_binned=False``.
     B_pred, B_pred_masked_0, B_pred_masked_1, condition_pred_0, condition_pred_1
-        Precomputed design matrices for the prediction grid.
+        Design matrices for the prediction grid.
     sample, sample_labels, sample_index
-        Only when binned with a `sample` (the slide or replicate each cell comes from): the column name, the
-        samples that have rows (in the order their index refers to) and per row the index of its sample. Rows are
-        then one per (sample, bin), and `condition` is each sample's condition.
+        Only when binned with `sample`: the column, the samples that have rows, and per row its sample's
+        index. Rows are then one per (sample, bin).
     n_obs, n_obs_grid, ss_within
-        Only for contiguous bins (``window_radius=None``), `None` otherwise:
-        the number of cells behind each row of `Y`, the number per grid point
-        (``n_categories x (n_bins + 1)``, rows in the order of the condition
-        codes; zero for empty bins), and per gene the within-bin sum of
-        squares summed over all rows. With these the fitters weight each row
-        by its cell count and recover the cell-level noise, so a binned fit
-        matches a fit on the cells (see `weighted`).
+        Only for contiguous bins (``window_radius=None``): cells per row, cells per grid point
+        (``n_categories x (n_bins + 1)``) and per gene the within-bin sum of squares. The fitters use them
+        to weight rows by cell count, so a binned fit matches a fit on the cells.
     """
 
     genes: list
@@ -319,9 +287,7 @@ class BinnedData:
     B_pred_masked_1: np.ndarray | None
     condition_pred_0: np.ndarray | None
     condition_pred_1: np.ndarray | None
-    # Defaulted so that a `binned` dict written before these existed still
-    # reconstructs; they only record where the unbinned data came from, for
-    # `diffsvg.tl.fit_model(..., use_binned=False)`.
+    # Defaulted so that a `binned` dict written before these existed still reconstructs.
     design_matrix: str = "design_matrix"
     layer: str | None = None
     n_obs: np.ndarray | None = None
