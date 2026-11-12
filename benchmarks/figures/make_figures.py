@@ -157,3 +157,35 @@ ax.set_ylabel("zonation slope per donor\n(log1p per 500 µm)")
 ax.set_title("One dot per donor: zonation gradients are flatter in fibrotic livers", fontsize=9, color=INK, loc="left")
 ax.legend(handles=[Patch(color=BLUE, label="healthy (3)"), Patch(color=ORANGE, label="fibrotic (4)")], fontsize=7, loc="lower left")
 save(fig, "fig5_liver_donor_slopes")
+
+# ---------------------------------------------------------------- 6. liver volcano (diffsvg slope test, markers labelled)
+from diffsvg.tl.model import _benjamini_hochberg as bh
+
+v = pd.read_csv(liver / "disease_donor_slope_tau0.csv", index_col=0)
+markers_pc = ["CYP2E1", "CYP1A2", "CYP3A4", "GLUL", "RHBG"]
+markers_pp = ["SDS", "ASS1", "HAL", "PCK1", "CPS1", "G6PC", "ALDOB", "SERPINA1"]
+mk = [g for g in markers_pc + markers_pp if g in v.index]
+v["marker_fdr"] = np.nan
+v.loc[mk, "marker_fdr"] = bh(v.loc[mk, "slope_pval"].to_numpy())
+fig, ax = plt.subplots(figsize=(4.6, 3.6))
+y = -np.log10(v.slope_pval)
+other = ~v.index.isin(mk)
+ax.scatter(v.slope_diff[other], y[other], s=8, color="#b9b8b0", linewidth=0, zorder=2, label="other genes")
+for genes_, color, lab in ((markers_pc, BLUE, "pericentral markers"), (markers_pp, ORANGE, "periportal markers")):
+    g_ = [g for g in genes_ if g in v.index]
+    ax.scatter(v.slope_diff[g_], y[g_], s=30, color=color, edgecolor="white", linewidth=1, zorder=3, label=lab)
+    for g in g_:
+        if v.loc[g, "marker_fdr"] < 0.05:
+            ax.annotate(g, (v.slope_diff[g], y[g]), xytext=(4, 2), textcoords="offset points", fontsize=7, color=INK)
+thr_genome = v.slope_pval[v.slope_pval_adj < 0.05].max() if (v.slope_pval_adj < 0.05).any() else 0.05 * 1 / len(v)
+thr_marker = v.loc[mk].slope_pval[v.loc[mk].marker_fdr < 0.05].max()
+ax.axhline(-np.log10(thr_marker), color=MUTED, lw=0.8, ls="--")
+ax.text(ax.get_xlim()[0], -np.log10(thr_marker), " FDR 0.05 within markers", fontsize=7, color=MUTED, va="bottom")
+ax.axhline(-np.log10(thr_genome), color=MUTED, lw=0.8, ls=":")
+ax.text(ax.get_xlim()[0], -np.log10(thr_genome), " FDR 0.05 across 313 genes", fontsize=7, color=MUTED, va="bottom")
+ax.axvline(0, color=MUTED, lw=0.6)
+ax.set_xlabel("slope difference, healthy − fibrotic (log1p per 500 µm)")
+ax.set_ylabel("−log10 p (slope test, F(1, 5))")
+ax.set_title("Zonation genes lose their gradient in fibrosis", fontsize=9, color=INK, loc="left")
+ax.legend(fontsize=7, loc="lower right")
+save(fig, "fig6_liver_volcano")
