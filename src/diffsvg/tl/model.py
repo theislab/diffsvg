@@ -808,14 +808,99 @@ def _wald_gene_stats(draws0, draws1, idata, shared, moments=None):
     coefficients behind ``d(x) = f1(x) - f0(x)`` (rank ``n_bsplines``: the level plus the shape directions).
     """
     if moments is None:
-        wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
+        delta = draws1 - draws0
+        delta_mean = delta.mean(axis=0)
+        cov = np.cov(delta, rowvar=False)
+    else:
+        A0, A1 = _condition_maps(shared)
+        A = A1 - A0
+        delta_mean, cov = A @ moments[0], A @ moments[1] @ A.T
+    wald_stat, wald_pval, wald_df = _wald_from_moments(delta_mean, cov, df_denominator=shared.df_denominator)
+    T = float(np.mean(delta_mean**2))
+    row = {"wald_stat": wald_stat, "wald_pval": wald_pval, "wald_df": wald_df, "T": T}
+    if shared.df_denominator is not None:
+        row["wald_df_denominator"] = shared.df_denominator
+    return row, delta_mean
+
+
+def _level_weights(bin_centers):
+    """Trapezoid weights that turn a curve on the grid into its mean over ``[0, 1]``."""
+    x = np.asarray(bin_centers, dtype=float)
+    w = np.zeros(len(x))
+    dx = np.diff(x)
+    w[:-1] += dx / 2
+    w[1:] += dx / 2
+    return w / (x[-1] - x[0])
+
+
+def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
+    """Test of the level difference ``mean_x (f1 - f0)``, ``H0: |level| <= tau``, plus its credible interval."""
+    a = _level_weights(shared.bin_centers)
+    level_draws = (draws1 - draws0) @ a
+    if moments is None:
+        delta_mean = (draws1 - draws0).mean(axis=0)
+        level, var = float(level_draws.mean()), float(level_draws.var(ddof=1))
     else:
         A0, A1 = _condition_maps(shared)
         A = A1 - A0
         delta_mean = A @ moments[0]
-        wald_stat, wald_pval, wald_df = _wald_from_moments(delta_mean, A @ moments[1] @ A.T)
-    T = float(np.mean(delta_mean**2))
-    return {"wald_stat": wald_stat, "wald_pval": wald_pval, "wald_df": wald_df, "T": T}, delta_mean
+        level, var = float(a @ delta_mean), float(a @ A @ moments[1] @ A.T @ a)
+    stat = level**2 / var
+    pval = _one_df_pval(stat, var, shared.tau, shared.df_denominator)
+    low, high = (float(v) for v in np.quantile(level_draws, [0.03, 0.97]))
+    row = {"level_diff": level, "level_diff_ci_low": low, "level_diff_ci_high": high, "level_stat": stat, "level_pval": pval}
+    if shared.df_denominator is not None:
+        row["level_df_denominator"] = shared.df_denominator
+    return row, delta_mean
+
+
+def _level_panel_stats(stats_df, null_quantile):
+    stats_df["level_pval_adj"] = _benjamini_hochberg(stats_df["level_pval"].to_numpy())
+
+
+def _one_df_pval(stat, var, tau, df_denominator):
+    """p-value of ``stat = estimate^2 / var`` for ``H0: |effect| <= tau`` (1 df; F with slides)."""
+    noncentrality = tau**2 / var
+    if df_denominator is None:
+        return float(ncx2.sf(stat, 1, noncentrality)) if tau > 0 else float(chi2.sf(stat, 1))
+    if tau > 0:
+        return float(ncf.sf(stat, 1, df_denominator, noncentrality))
+    return float(f.sf(stat, 1, df_denominator))
+
+
+def _slope_gene_stats(draws0, draws1, idata, shared, moments=None):
+    """Test of the slope difference: the least-squares slope of ``f1 - f0`` over ``[0, 1]``, ``H0: |slope| <= tau``.
+
+    One degree of freedom, so with few replicates it has far more power than the ``K - 1`` df parallel test
+    for a gradient that steepens or flattens.
+    """
+    weights = shared.slope_weights
+    beta_1 = _posterior_draws(idata, "beta_1")
+    slope_draws = beta_1 @ weights
+    if moments is None:
+        slope, var = float(slope_draws.mean()), float(slope_draws.var(ddof=1))
+        delta_mean = (draws1 - draws0).mean(axis=0)
+    else:
+        b1 = slice(shared.n_bsplines + 2, 2 * shared.n_bsplines + 2)
+        slope, var = float(moments[0][b1] @ weights), float(weights @ moments[1][b1, b1] @ weights)
+        A0, A1 = _condition_maps(shared)
+        delta_mean = (A1 - A0) @ moments[0]
+    stat = slope**2 / var
+    low, high = (float(v) for v in np.quantile(slope_draws, [0.03, 0.97]))
+    row = {
+        "slope_diff": slope,
+        "slope_diff_ci_low": low,
+        "slope_diff_ci_high": high,
+        "slope_stat": stat,
+        "slope_pval": _one_df_pval(stat, var, shared.tau, shared.df_denominator),
+    }
+    if shared.df_denominator is not None:
+        row["slope_df_denominator"] = shared.df_denominator
+    return row, delta_mean
+
+
+def _slope_panel_stats(stats_df, null_quantile):
+    stats_df["slope_pval_adj"] = _benjamini_hochberg(stats_df["slope_pval"].to_numpy())
 
 
 def _wald_panel_stats(stats_df, null_quantile):
@@ -868,6 +953,8 @@ def _parallel_panel_stats(stats_df, null_quantile):
 _TESTS = {
     "wald": (_wald_gene_stats, _wald_panel_stats),
     "parallel": (_parallel_gene_stats, _parallel_panel_stats),
+    "level": (_level_gene_stats, _level_panel_stats),
+    "slope": (_slope_gene_stats, _slope_panel_stats),
 }
 
 
@@ -965,7 +1052,7 @@ def fit_model(
     null_quantile=0.9,
     sample_kwargs=None,
     test="parallel",
-    tau=0.1,
+    tau=None,
     predictive_seed=None,
     inference="auto",
     coefs_key="dsvg_coefs",
@@ -1057,13 +1144,27 @@ def fit_model(
           ``wald_pval_adj`` and ``T``, the mean squared difference). It has
           no `tau`, so with many cells nearly every gene with any difference
           becomes significant; rank by ``wald_stat`` rather than thresholding.
+        - ``"level"``: whether the curves differ in level, i.e. in the mean
+          of ``f1 - f0`` over the anchor range, beyond `tau` (``H0: |level|
+          <= tau``; noncentral chi-square with 1 degree of freedom). The
+          complement of ``"parallel"``, which ignores the level. Columns
+          ``level_diff`` (with a 94% credible interval), ``level_stat``,
+          ``level_pval`` and ``level_pval_adj``.
+        - ``"slope"``: whether the gap between the curves changes linearly
+          along the anchor, i.e. whether one gradient is steeper than the
+          other: the least-squares slope of ``f1 - f0`` over ``[0, 1]``,
+          ``H0: |slope| <= tau``, 1 degree of freedom. With few replicates it
+          has far more power than ``"parallel"`` (``n_bsplines - 1`` df) for
+          gradients that steepen or flatten, and it misses non-monotone
+          changes, which ``"parallel"`` covers. Columns ``slope_diff`` (with
+          a 94% credible interval), ``slope_stat``, ``slope_pval`` and
+          ``slope_pval_adj``.
 
-        With data binned with `sample` (several slides per condition) only
-        ``"parallel"`` is available. The model then has a random level and a
+        With data binned with `sample` (several slides per condition) the model has a random level and a
         random curve per slide, so the covariance of the interaction
         coefficients holds the variation between slides, and the p-value
         uses an F reference with ``n_slides - 2`` denominator degrees of
-        freedom (column ``parallel_df_denominator``). The fitted curves are
+        freedom for every test (column ``*_df_denominator``). The fitted curves are
         the population-level ones. Fit on bins (NUTS is fine) or on cells
         (``use_binned=False``).
 
@@ -1076,11 +1177,13 @@ def fit_model(
         bins (``bin_obs(..., window_radius=None)``) and fits on the cells
         (``use_binned=False``) do not have that problem.
     tau
-        Only for ``test="parallel"``: the smallest shape difference that
-        counts, in the units of ``shape_diff`` (see `parallel_curves_test`).
-        The p-value tests ``shape_diff <= tau``, so smaller differences do
-        not become significant however many cells there are. ``0`` tests
-        whether the curves are exactly parallel.
+        For the ``"parallel"``, ``"level"`` and ``"slope"`` tests: the
+        smallest difference that counts (``shape_diff``, ``level_diff`` or
+        ``slope_diff``). The p-value tests ``|difference| <= tau``, so smaller
+        differences do not become significant however many cells there are.
+        Defaults to ``0.1`` for pooled data and to ``0`` for data binned with
+        `sample`, where the variation between slides already calibrates the
+        test and a positive `tau` only costs power.
     predictive_seed
         Deprecated, has no effect. The curves, their bands, ``integral`` and
         the Wald test are now computed from the posterior draws of the mean
@@ -1112,7 +1215,7 @@ def fit_model(
     """
     if test not in _TESTS:
         raise ValueError(f"Unknown test {test!r}. Available: {sorted(_TESTS)}")
-    if tau < 0:
+    if tau is not None and tau < 0:
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
     inference = _resolve_inference(inference, model_setup)
     if inference == "exact":
@@ -1141,9 +1244,9 @@ def fit_model(
     B, B_masked, condition_fit, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     weights, ss_within, n_obs_grid = _weighting(binned, use_binned)
     sample_index, n_samples = _sample_inputs(adata, binned, use_binned)
+    if tau is None:
+        tau = 0.0 if n_samples is not None else 0.1
     if n_samples is not None:
-        if test != "parallel":
-            raise ValueError("Data binned with `sample` support only `test='parallel'`.")
         if n_samples < 3:
             raise ValueError(f"Comparing conditions across slides needs at least 3 slides, found {n_samples}.")
     if test == "parallel" and use_binned and not binned.weighted:
@@ -1175,7 +1278,7 @@ def fit_model(
         test=test,
         tau=float(tau),
         shape_metric=shape_metric(binned.n_bsplines, binned.degree) if test == "parallel" else None,
-        slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test == "parallel" else None,
+        slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test in ("parallel", "slope") else None,
         weights=weights,
         inference=inference,
         sample_index=sample_index,
@@ -1209,7 +1312,7 @@ def fit_model(
 
     stats_df = pd.DataFrame(stats_rows).set_index("gene").reindex(binned.genes)
     _TESTS[test][1](stats_df, null_quantile)
-    test_params = {"test": test, "tau": float(tau)} if test == "parallel" else {"test": test}
+    test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level", "slope") else {"test": test}
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer
@@ -1569,11 +1672,12 @@ def pattern_wald_test(pred0, pred1, ridge=0.0):
     return W, pval, df, mu
 
 
-def _wald_from_moments(mu, Sigma, ridge=0.0):
+def _wald_from_moments(mu, Sigma, ridge=0.0, df_denominator=None):
     """Wald statistic of ``mu`` against covariance `Sigma`, pseudoinverse over its non-null directions.
 
     The cutoff is relative, so the degrees of freedom are the rank of the difference curve, not the
-    number of grid points. Returns ``(stat, pval, df)``.
+    number of grid points. With `df_denominator` (slides) the p-value is from ``F(df, df_denominator)``
+    on ``stat / df``, as in `parallel_curves_test`. Returns ``(stat, pval, df)``.
     """
     eigvals, eigvecs = np.linalg.eigh(Sigma)
     if ridge:
@@ -1582,7 +1686,8 @@ def _wald_from_moments(mu, Sigma, ridge=0.0):
     z = eigvecs[:, keep].T @ mu
     W = float((z**2 / eigvals[keep]).sum())
     df = int(keep.sum())
-    return W, float(chi2.sf(W, df)), df
+    pval = float(chi2.sf(W, df)) if df_denominator is None else float(f.sf(W / df, df, df_denominator))
+    return W, pval, df
 
 
 def _shape_grid(n_bsplines, degree, n_grid):

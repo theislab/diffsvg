@@ -137,6 +137,7 @@ _AXIS_LABELS = {
     # `integral` is the area under f1 - f0 (condition 1 minus condition 0).
     "integral": r"$\Delta_{f_1 - f_0}$",
     "slope_diff": r"$\Delta$ slope ($f_1 - f_0$)",
+    "level_diff": r"$\Delta$ level ($f_1 - f_0$)",
     "shape_diff": "shape difference",
 }
 
@@ -216,6 +217,10 @@ def plot_volcano(
     """
     if _is_parallel_table(stats_df):
         defaults = ("slope_diff", "parallel_pval", "parallel_pval_adj")
+    elif "slope_pval" in stats_df.columns:
+        defaults = ("slope_diff", "slope_pval", "slope_pval_adj")
+    elif "level_pval" in stats_df.columns:
+        defaults = ("level_diff", "level_pval", "level_pval_adj")
     else:
         defaults = ("integral", "wald_pval", "wald_pval_adj")
     x, pvalue, pvalue_adj = (
@@ -458,7 +463,7 @@ def plot_pvalue_histogram(
     matplotlib.axes.Axes
     """
     if pvalue is None:
-        pvalue = "parallel_pval" if _is_parallel_table(stats_df) else "wald_pval"
+        pvalue = next(c for c in ("parallel_pval", "slope_pval", "level_pval", "wald_pval") if c in stats_df.columns)
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 

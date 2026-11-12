@@ -120,7 +120,7 @@ def check_stability(
     design_matrix="design_matrix",
     sample_kwargs=None,
     test="parallel",
-    tau=0.1,
+    tau=None,
     sample=None,
     inference="auto",
 ):
