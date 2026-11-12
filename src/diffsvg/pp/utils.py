@@ -1,5 +1,6 @@
 """Helpers for turning per-cell expression into per-bin summaries used by the GAMs in ``diffsvg.tl.model``."""
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -316,6 +317,34 @@ class BinnedData:
         return self.ss_within is not None
 
 
+def _warn_possible_replicates(design_matrix_df, anchor, condition):
+    """Warn when a design-matrix column looks like slides (nested in `condition`, >= 2 per level) but is not used.
+
+    Without `sample`, every cell counts as an independent replicate. Differences between slides then look like
+    differences between conditions; on real multi-slide data this produces many false positives.
+    """
+    cond = design_matrix_df[condition]
+    for col in design_matrix_df.columns:
+        if col in (anchor, condition):
+            continue
+        values = design_matrix_df[col]
+        if pd.api.types.is_float_dtype(values) or values.nunique(dropna=True) > 1000:
+            continue
+        pairs = pd.DataFrame({"s": values, "c": cond}).dropna().drop_duplicates()
+        nested = not pairs["s"].duplicated().any()
+        per_condition = pairs.groupby("c", observed=True)["s"].nunique()
+        if nested and len(per_condition) == 2 and per_condition.min() >= 2:
+            warnings.warn(
+                f"Column {col!r} looks like replicates (slides/samples) nested in {condition!r} "
+                f"({per_condition.min()}+ per condition), but `sample` was not given, so every cell is treated as "
+                f"an independent replicate and slide-to-slide variation counts as a condition effect. Pass "
+                f"`sample={col!r}` to model it.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return
+
+
 def _condition_levels(values):
     """The levels of a condition column, in the order that fixes the 0/1 coding.
 
@@ -442,6 +471,9 @@ def bin_obs(
         levels = _condition_levels(design_matrix_df[condition])
         if len(levels) != 2:
             raise ValueError(f"`condition` column {condition!r} must have exactly two levels, found: {levels}")
+
+    if condition is not None and sample is None:
+        _warn_possible_replicates(design_matrix_df, anchor, condition)
 
     binned = bin_counts(
         adata,
