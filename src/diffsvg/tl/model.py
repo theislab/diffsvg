@@ -1048,10 +1048,15 @@ def _summarise_gene(gene, idata, shared, fit_columns, moments=None):
 
 def _exact_settings(sample_kwargs):
     settings = {"draws": 1000, "random_seed": 42, "n_grid": 81}
-    settings.update(sample_kwargs or {})
-    unknown = set(settings) - {"draws", "random_seed", "n_grid"}
-    if unknown:
-        raise ValueError(f"Unknown settings for inference='exact': {sorted(unknown)} (allowed: draws, random_seed, n_grid)")
+    given = dict(sample_kwargs or {})
+    ignored = sorted(set(given) - set(settings))
+    if ignored:
+        warnings.warn(
+            f"inference='exact' ignores the sampler settings {ignored} (it uses only draws, random_seed, n_grid).",
+            UserWarning,
+            stacklevel=3,
+        )
+    settings.update({k: v for k, v in given.items() if k in settings})
     return settings
 
 
