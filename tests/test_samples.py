@@ -123,6 +123,7 @@ def test_slides_stop_the_pooled_overconfidence():
         "tau": 0.0,
         "inplace": False,
         "progressbar": False,
+        "inference": "nuts",
         "chains": 2,
         "draws": 300,
         "tune": 300,

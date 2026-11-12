@@ -1567,7 +1567,7 @@ def fit_model(
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
     inference = _resolve_inference(inference, model_setup)
     if inference == "exact":
-        sample_defaults = _exact_settings(sample_kwargs)
+        sample_defaults = _exact_settings({**(sample_kwargs or {}), **pymc_kwargs})
     elif inference == "nuts":
         sample_defaults = {
             "nuts_sampler": "nutpie",
@@ -1803,7 +1803,7 @@ def fit_profiles(
         "progressbar": False,
     }
     if inference == "exact":
-        sample_defaults = _exact_settings(sample_kwargs)
+        sample_defaults = _exact_settings({**(sample_kwargs or {}), **pymc_kwargs})
     else:
         sample_defaults.update(sample_kwargs or {})
         sample_defaults.update(pymc_kwargs)
