@@ -102,3 +102,27 @@ def test_exact_slides_match_nuts():
         np.testing.assert_allclose(exact["parallel_pval"], nuts["parallel_pval"], atol=0.05)
         np.testing.assert_allclose(exact["sample_level_sd"], nuts["sample_level_sd"], rtol=0.15)
         assert exact["exact_edge_mass"].max() < 0.05
+
+
+def test_exact_runs_without_pymc():
+    """The core install has no PyMC: exact inference must not import it, and NUTS must say how to get it."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "for m in ('pymc', 'pytensor', 'arviz', 'nutpie'): sys.modules[m] = None\n"
+        "import numpy as np, pandas as pd, anndata as ad, diffsvg as dvg\n"
+        "rng = np.random.default_rng(0); n = 2000; x = rng.random(n); x[:4] = 0, 0, 1, 1\n"
+        "a = ad.AnnData((np.sin(3 * x)[:, None] + rng.normal(size=(n, 2))).astype('float32'))\n"
+        "a.obsm['design_matrix'] = pd.DataFrame({'anchor': x, 'condition': np.where(np.arange(n) % 2, 'a', 'b')}, index=a.obs_names)\n"
+        "dvg.pp.bin_obs(a, anchor='anchor', condition='condition', n_bins=10)\n"
+        "dvg.tl.fit_model(a, dvg.tl.setup_model(a), progressbar=False)\n"
+        "try:\n"
+        "    dvg.tl.fit_model(a, dvg.tl.setup_model(a), inference='nuts', progressbar=False)\n"
+        "except ImportError as e:\n"
+        "    assert 'diffsvg[pymc]' in str(e)\n"
+        "else:\n"
+        "    raise AssertionError('nuts ran without pymc')\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
