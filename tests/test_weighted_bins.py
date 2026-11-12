@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 import diffsvg as dvg
-from diffsvg.tl.model import _build_gene_model, _predictive_seeds, _weighting
+from diffsvg.tl.model import _build_gene_model, _weighting
 
 N_BINS = 20
 
@@ -48,11 +48,15 @@ def test_contiguous_bins_count_every_cell_once():
     assert b.ss_within["g0"] == pytest.approx(ss_total)
 
 
-def test_sliding_bins_stay_unweighted():
-    b = dvg.pp.bin_obs(_adata(_positions(2000)), anchor="anchor", condition="condition", inplace=False)
+def test_sliding_bins_are_weighted_by_cell_count_without_within_term():
+    b = dvg.pp.bin_obs(
+        _adata(_positions(2000)), anchor="anchor", condition="condition", window_radius=0.02, inplace=False
+    )
     assert not b.weighted
-    assert b.n_obs is None and b.n_obs_grid is None and b.ss_within is None
-    assert _weighting(b, use_binned=True) == (None, None, None)
+    assert b.n_obs_grid is None and b.ss_within is None
+    weights, ss_within, n_obs_grid = _weighting(b, use_binned=True)
+    np.testing.assert_array_equal(weights, b.n_obs)
+    assert ss_within is None and n_obs_grid is None
 
 
 def test_weighted_bins_have_the_per_cell_likelihood():
@@ -77,11 +81,3 @@ def test_weighted_bins_have_the_per_cell_likelihood():
     logp_binned, logp_cells = binned_model.compile_logp(), cell_model.compile_logp()
     gaps = [logp_binned(p) - logp_cells(p) for p in points]
     np.testing.assert_allclose(gaps, gaps[0], rtol=0, atol=1e-6 * abs(logp_cells(points[0])))
-
-
-def test_predictive_seeds_are_reproducible_and_distinct():
-    seeds = _predictive_seeds(42, n_genes=5, per_gene=2)
-    assert seeds == _predictive_seeds(42, n_genes=5, per_gene=2)
-    flat = [s for pair in seeds for s in pair]
-    assert len(set(flat)) == len(flat)  # differs between genes and between the two condition levels
-    assert _predictive_seeds(None, n_genes=3, per_gene=2) == [(None, None)] * 3

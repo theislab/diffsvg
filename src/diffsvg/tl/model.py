@@ -6,7 +6,7 @@ and writes the result to ``adata.varm``.
 
 Parallelization: workers receive only plain arrays (the shared design matrices plus the gene's `Y`) and
 build their own `pm.Model` with `_build_gene_model`. A built model cannot be shipped instead (PyTensor
-graph nodes do not pickle), and reusing one compiled model via `pm.set_data` across workers would race.
+graph nodes do not pickle), and every worker is a separate process, so each compiles its own.
 """
 
 import contextlib
@@ -302,8 +302,6 @@ class _FitShared:
     # Cells per row, and per grid point for predictions, when fitting weighted
     # contiguous bins (see `_weighting`); `None` otherwise.
     weights: np.ndarray | None = None
-    weights_pred_0: np.ndarray | None = None
-    weights_pred_1: np.ndarray | None = None
     # How the posterior is obtained, see `_INFERENCE`.
     inference: str = "nuts"
     # The slide of every fitted row and the denominator degrees of freedom of the test, for fits with `sample`.
@@ -322,7 +320,6 @@ class _ProfileShared:
     priors: dict
     B_pred: np.ndarray
     weights: np.ndarray | None = None
-    weights_pred: np.ndarray | None = None
 
 
 def _fitted_cells(design, binned):
@@ -400,27 +397,21 @@ def _weighting(binned, use_binned):
     per gene the within-row sum of squares with its degrees of freedom
     (``n_cells - n_rows``), and the cells per grid point. Predictions use the
     latter, so a predicted value is a bin mean just like a fitted row. Fits on
-    the cells, or on overlapping bins, are unweighted.
+    the cells are unweighted. Overlapping bins are weighted by their cell
+    counts too (a window with 2 cells must not count as much as one with
+    500, which otherwise bends the curve at the sparse ends of the range),
+    but have no within-row term: their rows share cells.
     """
-    if not (use_binned and binned.weighted):
+    if not use_binned:
         return None, None, None
+    if not binned.weighted:
+        if binned.n_obs is None:  # binned before the counts were recorded for overlapping bins
+            return None, None, None
+        return np.asarray(binned.n_obs, dtype=float), None, None
     weights = np.asarray(binned.n_obs, dtype=float)
     df = float(weights.sum() - len(weights))
     ss_within = {gene: (float(binned.ss_within[gene]), df) for gene in binned.genes}
     return weights, ss_within, np.asarray(binned.n_obs_grid, dtype=float)
-
-
-def _predictive_seeds(seed, n_genes, per_gene):
-    """Independent integer seeds for each gene's posterior-predictive draws, or `None`s when `seed` is `None`.
-
-    Drawn from one `numpy.random.SeedSequence`, so they are reproducible and
-    differ between genes and between the two condition levels - equal seeds
-    for both levels would draw identical noise and cancel it in their difference.
-    """
-    if seed is None:
-        return [(None,) * per_gene] * n_genes
-    states = np.random.SeedSequence(seed).generate_state(n_genes * per_gene)
-    return [tuple(int(v) for v in states[i * per_gene : (i + 1) * per_gene]) for i in range(n_genes)]
 
 
 @contextlib.contextmanager
@@ -915,13 +906,35 @@ _INFERENCE = {
 }
 
 
-def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None, seeds=(None, None)):
+def _posterior_draws(idata, name):
+    """Posterior draws of one variable, flattened over chains: ``(n_draws,)`` or ``(n_draws, dim)``."""
+    values = idata.posterior[name].stack(sample=("chain", "draw")).to_numpy()
+    return values.T if values.ndim == 2 else values
+
+
+def _mean_curve_draws(idata, shared):
+    """Posterior draws of both condition curves on the grid, ``(n_draws, n_grid)`` each.
+
+    The mean function ``intercept + B beta + condition * categorical_beta + B_masked beta_1`` at every
+    draw, without observation noise and without slide effects.
+    """
+    intercept = _posterior_draws(idata, "intercept")
+    beta = _posterior_draws(idata, "beta")
+    beta_1 = _posterior_draws(idata, "beta_1")
+    cb = _posterior_draws(idata, "categorical_beta")
+    base = intercept[:, None] + beta @ shared.B_pred.T
+    draws0 = base + cb[:, None] * shared.condition_pred_0[None, :] + beta_1 @ shared.B_pred_masked_0.T
+    draws1 = base + cb[:, None] * shared.condition_pred_1[None, :] + beta_1 @ shared.B_pred_masked_1.T
+    return draws0, draws1
+
+
+def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None):
     """Build and fit one gene's model in this worker, then predict both condition curves on the grid.
 
     Returns ``(gene, stats_row, curve_row)``: `stats_row` holds the test's columns and the shared ones;
     `curve_row` holds the mean difference curve ``"delta"``, per condition the mean curve and its 94% band
     (``"cond{0,1}_{mean,ci_low,ci_high}"``) and the posterior means of ``"beta"`` and ``"beta_1"``.
-    `ss_within` is the gene's within-row term (see `_weighting`), `seeds` the predictive seeds per condition.
+    `ss_within` is the gene's within-row term (see `_weighting`).
     """
 
     def build(sample_scales=None):
@@ -943,7 +956,6 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
         )
 
     model = build()
-    n_grid = shared.B_pred.shape[0]
     slides = shared.sample_index is not None
 
     with _quiet_pymc():
@@ -962,44 +974,22 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
                         "sample_level_sd": float(idata.posterior["sample_level_sd"].mean()),
                         "sample_curve_sd": float(idata.posterior["sample_curve_sd"].mean()),
                     }
-        with model:  # the model the draws belong to (empirical Bayes fits a copy with the scales fixed)
-            grid_data = {
-                "B_data": shared.B_pred,
-                "condition_data": shared.condition_pred_0,
-                "B_masked_data": shared.B_pred_masked_0,
-                "Y_data": np.zeros(n_grid),
-            }
-            if shared.weights is not None:
-                grid_data["w_data"] = shared.weights_pred_0
-            if shared.sample_index is not None:  # population-level curves: no slide effects on the grid
-                grid_data.update(sample_data=np.zeros(n_grid, dtype="int64"), sample_on=np.zeros(n_grid))
-            pm.set_data(grid_data)
-            pred0 = pm.sample_posterior_predictive(
-                idata, var_names=["D"], extend_inferencedata=False, progressbar=False, random_seed=seeds[0]
-            )
+        # The condition curves are the posterior of the mean function on the grid (slide effects off, i.e.
+        # population level). No observation noise: the bands are credible bands of the curve, and the Wald
+        # test below sees the covariance of the coefficients rather than that of new observations.
+        draws0, draws1 = _mean_curve_draws(idata, shared)
 
-            grid_data.update(condition_data=shared.condition_pred_1, B_masked_data=shared.B_pred_masked_1)
-            if shared.weights is not None:
-                grid_data["w_data"] = shared.weights_pred_1
-            pm.set_data(grid_data)
-            pred1 = pm.sample_posterior_predictive(
-                idata, var_names=["D"], extend_inferencedata=False, progressbar=False, random_seed=seeds[1]
-            )
+        test_row, delta_mean = _TESTS[shared.test][0](draws0, draws1, idata, shared)
+        cond0_mean, cond1_mean = draws0.mean(axis=0), draws1.mean(axis=0)
+        cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
+        cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
+        integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
 
-            draws0 = pred0.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
-            draws1 = pred1.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T
-
-            test_row, delta_mean = _TESTS[shared.test][0](draws0, draws1, idata, shared)
-            cond0_mean, cond1_mean = draws0.mean(axis=0), draws1.mean(axis=0)
-            cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
-            cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
-            integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
-
-            # From the posterior directly: `az.summary`'s column names change across arviz versions.
-            post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
-            ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
-            beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
-            beta_1_mean = idata.posterior["beta_1"].mean(("chain", "draw")).to_numpy()
+        # From the posterior directly: `az.summary`'s column names change across arviz versions.
+        post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
+        ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
+        beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
+        beta_1_mean = idata.posterior["beta_1"].mean(("chain", "draw")).to_numpy()
 
     stats_row = {
         "gene": gene,
@@ -1024,7 +1014,7 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
     return gene, stats_row, curve_row
 
 
-def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None, seeds=(None,)):
+def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None):
     """`_fit_and_predict_gene` for the condition-free model: one curve, no test. Returns ``(gene, diag_row, curve_row)``."""
     model = _build_profile_model(
         Y,
@@ -1036,58 +1026,64 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
         weights=shared.weights,
         ss_within=ss_within,
     )
-    n_grid = shared.B_pred.shape[0]
-
     with model, _quiet_pymc():
         idata, diag_columns = _sample_nuts(model, sample_kwargs, ["intercept", "beta", "sigma"])
 
-        grid_data = {"B_data": shared.B_pred, "Y_data": np.zeros(n_grid)}
-        if shared.weights is not None:
-            grid_data["w_data"] = shared.weights_pred
-        pm.set_data(grid_data)
-        pred = pm.sample_posterior_predictive(
-            idata, var_names=["D"], extend_inferencedata=False, progressbar=False, random_seed=seeds[0]
-        )
-
-        draws = pred.posterior_predictive["D"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, n_grid)
-        mean = draws.mean(axis=0)
-        ci_low, ci_high = np.quantile(draws, [0.03, 0.97], axis=0)
-        beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
+    # Posterior of the mean function on the grid: credible bands, no observation noise (see `_mean_curve_draws`).
+    draws = _posterior_draws(idata, "intercept")[:, None] + _posterior_draws(idata, "beta") @ shared.B_pred.T
+    mean = draws.mean(axis=0)
+    ci_low, ci_high = np.quantile(draws, [0.03, 0.97], axis=0)
+    beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
 
     diag_row = {"gene": gene, **diag_columns}
     curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high, "beta": beta_mean}
     return gene, diag_row, curve_row
 
 
-def _compute_null_pvalues(T_values, null_quantile=0.9):
-    """Empirical + Gamma-null p-values for an array of functional Wald/`T` statistics.
+def _gamma_null_pvalues(T_values, null_quantile=0.9):
+    """Gamma-null p-values for `T_values`, the null fitted to the lower `null_quantile` of them.
 
-    tradeSeq-style: the lower `null_quantile` fraction of `T_values` is
-    treated as an empirical null population.
+    Assumes that at least a `null_quantile` fraction of the values come from the null. The Gamma is fitted
+    by maximum likelihood to the values below the cutoff *as a truncated sample* (each term divided by the
+    Gamma's mass below the cutoff); fitting it as if untruncated gives too light a tail and p-values that
+    are too small. Values that are missing or not finite get a missing p-value.
     """
     T_values = np.asarray(T_values, dtype=float)
-    cutoff = np.nanquantile(T_values, null_quantile)
-    null_pool = T_values[T_values <= cutoff]
+    finite = np.isfinite(T_values)
+    pvals = np.full(T_values.shape, np.nan)
+    if finite.sum() < 3:
+        return pvals
+    cutoff = np.quantile(T_values[finite], null_quantile)
+    pool = T_values[finite & (T_values <= cutoff) & (T_values > 0)]
+    if len(pool) < 3:
+        return pvals
+    shape0, _, scale0 = gamma.fit(pool, floc=0)
 
-    empirical_pvals = np.array([(1 + np.sum(null_pool >= t)) / (1 + len(null_pool)) for t in T_values])
+    def neg_log_lik(log_params):
+        a, scale = np.exp(log_params)
+        return -(gamma.logpdf(pool, a, scale=scale).sum() - len(pool) * gamma.logcdf(cutoff, a, scale=scale))
 
-    shape, loc, scale = gamma.fit(null_pool, floc=0)
-    gamma_pvals = 1 - gamma.cdf(T_values, a=shape, loc=loc, scale=scale)
-
-    return empirical_pvals, gamma_pvals
+    fit = optimize.minimize(neg_log_lik, np.log([shape0, scale0]), method="Nelder-Mead")
+    a, scale = np.exp(fit.x)
+    pvals[finite] = gamma.sf(T_values[finite], a, scale=scale)
+    return pvals
 
 
 def _benjamini_hochberg(pvals):
-    """Benjamini-Hochberg FDR-adjusted p-values (kept dependency-free rather than pulling in `statsmodels`)."""
+    """Benjamini-Hochberg FDR-adjusted p-values over the non-missing entries; missing ones stay missing."""
     pvals = np.asarray(pvals, dtype=float)
-    n = len(pvals)
-    order = np.argsort(pvals)
-    ranked = pvals[order] * n / np.arange(1, n + 1)
-    adjusted = np.minimum.accumulate(ranked[::-1])[::-1]
-    adjusted = np.clip(adjusted, 0, 1)
-
-    out = np.empty(n)
-    out[order] = adjusted
+    out = np.full(pvals.shape, np.nan)
+    present = np.isfinite(pvals)
+    p = pvals[present]
+    n = len(p)
+    if n == 0:
+        return out
+    order = np.argsort(p)
+    ranked = p[order] * n / np.arange(1, n + 1)
+    adjusted = np.clip(np.minimum.accumulate(ranked[::-1])[::-1], 0, 1)
+    filled = np.empty(n)
+    filled[order] = adjusted
+    out[present] = filled
     return out
 
 
@@ -1097,18 +1093,20 @@ def _benjamini_hochberg(pvals):
 
 
 def _wald_gene_stats(draws0, draws1, idata, shared):
-    """tradeSeq-style functional Wald test on the posterior-predictive curves, plus their `T` distance."""
+    """Wald test that the two condition curves are equal (level or shape), plus their `T` distance.
+
+    `draws0`/`draws1` are posterior draws of the mean curves, so the covariance is that of the
+    coefficients behind ``d(x) = f1(x) - f0(x)`` (rank ``n_bsplines``: the level plus the shape directions).
+    """
     wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
     T = compute_T(draws0.mean(axis=0), draws1.mean(axis=0))
     return {"wald_stat": wald_stat, "wald_pval": wald_pval, "wald_df": wald_df, "T": T}, delta_mean
 
 
 def _wald_panel_stats(stats_df, null_quantile):
-    stats_df["empirical_pval"], stats_df["gamma_pval"] = _compute_null_pvalues(
-        stats_df["T"].to_numpy(), null_quantile=null_quantile
-    )
-    stats_df["empirical_pval_adj"] = _benjamini_hochberg(stats_df["empirical_pval"].to_numpy())
-    stats_df["gamma_pval_adj"] = _benjamini_hochberg(stats_df["gamma_pval"].to_numpy())
+    # Per-gene p-values; only the FDR adjustment needs the panel. (The panel nulls on `T` that used to be
+    # here were circular: they always flagged the top `1 - null_quantile` of the genes.)
+    stats_df["wald_pval_adj"] = _benjamini_hochberg(stats_df["wald_pval"].to_numpy())
 
 
 def _parallel_gene_stats(draws0, draws1, idata, shared):
@@ -1154,6 +1152,58 @@ def _coef_columns(n_bsplines):
     return [f"B{k}" for k in range(n_bsplines)]
 
 
+def _warn_predictive_seed(predictive_seed):
+    if predictive_seed is not None:
+        warnings.warn(
+            "`predictive_seed` no longer has an effect: the curves are now the posterior of the mean function, "
+            "computed from the posterior draws without new random draws.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
+def _fittable_genes(genes, Y):
+    """The genes worth fitting. Genes whose fitted rows are constant (e.g. all zero) are left out with a
+    warning: the model reproduces them exactly, so the noise scale has no lower bound and the posterior
+    is improper (the sampler diverges and the test would be meaningless). Their stats stay missing."""
+    degenerate = [g for g in genes if not np.isfinite(Y[g]).all() or np.ptp(np.asarray(Y[g], dtype=float)) == 0]
+    if degenerate:
+        shown = ", ".join(degenerate[:10]) + (" ..." if len(degenerate) > 10 else "")
+        warnings.warn(
+            f"{len(degenerate)} gene(s) are constant or non-finite over the fitted rows and were not fitted "
+            f"(their stats are missing): {shown}",
+            UserWarning,
+            stacklevel=3,
+        )
+    return [g for g in genes if g not in set(degenerate)]
+
+
+def _check_slides_per_condition(binned, sample_index, condition_fit):
+    """The F reference uses ``n_slides - 2`` degrees of freedom, which assumes at least two slides per condition."""
+    codes = np.asarray(condition_fit, dtype=int)
+    per_condition = [len(np.unique(np.asarray(sample_index)[codes == c])) for c in (0, 1)]
+    if min(per_condition) < 2:
+        labels = binned.condition_categories
+        raise ValueError(
+            "Comparing conditions across slides needs at least 2 slides per condition, found "
+            f"{per_condition[0]} for {labels['0']!r} and {per_condition[1]} for {labels['1']!r}."
+        )
+
+
+def _warn_unsupported_range(binned):
+    """Warn when one condition has no cells over part of ``[0, 1]``: the curve there is extrapolated."""
+    empty = (np.asarray(binned.n_obs_grid) == 0).mean(axis=1)
+    if empty.max() > 0.1:
+        labels = binned.condition_categories
+        detail = ", ".join(f"{labels[str(c)]!r}: {100 * empty[c]:.0f}%" for c in (0, 1))
+        warnings.warn(
+            f"Part of the anchor range has no cells in one condition ({detail} of the grid empty). The curves "
+            "there are extrapolated from the spline and the prior, which inflates `shape_diff`/`integral`.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def fit_model(
     adata,
     model_setup,
@@ -1166,7 +1216,7 @@ def fit_model(
     curves_key="dsvg_curves",
     null_quantile=0.9,
     sample_kwargs=None,
-    test="wald",
+    test="parallel",
     tau=0.1,
     predictive_seed=None,
     inference="nuts",
@@ -1231,8 +1281,9 @@ def fit_model(
         `diffsvg.pl.plot_prediction_curve`. The condition labels are also
         written to ``adata.uns[f"{curves_key}_condition_categories"]``.
     null_quantile
-        Only for ``test="wald"``: passed to `_compute_null_pvalues` for the
-        empirical/Gamma null p-values.
+        No longer used by `fit_model` (kept for backwards compatibility).
+        The panel-based empirical/Gamma nulls it configured were circular;
+        ``test="wald"`` now has a per-gene p-value.
     sample_kwargs
         Extra keyword arguments merged into the `pymc.sample` call (applied
         to every gene). Any extra keyword arguments to `fit_model` itself are
@@ -1242,12 +1293,7 @@ def fit_model(
     test
         Which test to run between the two condition curves:
 
-        - ``"wald"`` (default): the tradeSeq-style functional Wald test on
-          the posterior-predictive curves (columns ``wald_stat``,
-          ``wald_pval``, ``wald_df``, ``T``), with p-values from an
-          empirical/Gamma null fitted to the gene panel (``empirical_pval``,
-          ``gamma_pval`` and their ``_adj`` versions; see `null_quantile`).
-        - ``"parallel"``: whether the curves are parallel, i.e. differ only
+        - ``"parallel"`` (default): whether the curves are parallel, i.e. differ only
           in level, via `parallel_curves_test` on the posterior of the
           interaction coefficients. The p-value is per gene, so it does not
           depend on the panel and works for a single gene. Columns
@@ -1256,6 +1302,13 @@ def fit_model(
           interval ``slope_diff_ci_low``/``slope_diff_ci_high``),
           ``parallel_stat``, ``parallel_df``, ``parallel_pval`` and
           ``parallel_pval_adj`` (Benjamini-Hochberg).
+        - ``"wald"``: whether the curves are equal at all (level or shape),
+          a tradeSeq-style functional Wald test on the posterior of the
+          difference curve, chi-square with ``n_bsplines`` degrees of
+          freedom (columns ``wald_stat``, ``wald_pval``, ``wald_df``,
+          ``wald_pval_adj`` and ``T``, the mean squared difference). It has
+          no `tau`, so with many cells nearly every gene with any difference
+          becomes significant; rank by ``wald_stat`` rather than thresholding.
 
         With data binned with `sample` (several slides per condition) only
         ``"parallel"`` is available. The model then has a random level and a
@@ -1281,11 +1334,9 @@ def fit_model(
         not become significant however many cells there are. ``0`` tests
         whether the curves are exactly parallel.
     predictive_seed
-        Seed for the posterior-predictive draws (the curves, their bands,
-        ``integral`` and the Wald test are built on them). Defaults to the
-        sampler's ``random_seed`` (42 unless set in `sample_kwargs`), so a fit
-        is reproducible as a whole; each gene and condition level gets its
-        own stream derived from it. `None` there leaves the draws unseeded.
+        Deprecated, has no effect. The curves, their bands, ``integral`` and
+        the Wald test are now computed from the posterior draws of the mean
+        function (no observation noise), so they need no extra random draws.
     inference
         How each gene's posterior is obtained:
 
@@ -1368,15 +1419,19 @@ def fit_model(
             raise ValueError("Data binned with `sample` support only `test='parallel'`.")
         if n_samples < 3:
             raise ValueError(f"Comparing conditions across slides needs at least 3 slides, found {n_samples}.")
-    if test == "parallel" and use_binned and weights is None:
+    if test == "parallel" and use_binned and not binned.weighted:
         warnings.warn(
             "test='parallel' on overlapping bins: neighbouring bins share cells, so the p-values come out too "
             "small. Re-run `diffsvg.pp.bin_obs(..., window_radius=None)`, or fit with `use_binned=False`.",
             UserWarning,
             stacklevel=2,
         )
-    seed = sample_defaults.get("random_seed") if predictive_seed is None else predictive_seed
-    seeds = dict(zip(binned.genes, _predictive_seeds(seed, len(binned.genes), per_gene=2), strict=True))
+    _warn_predictive_seed(predictive_seed)
+    if n_samples is not None:
+        _check_slides_per_condition(binned, sample_index, condition_fit)
+    if use_binned and binned.condition is not None and binned.n_obs_grid is not None:
+        _warn_unsupported_range(binned)
+    fit_genes = _fittable_genes(binned.genes, Y)
     shared = _FitShared(
         B=B,
         B_masked=B_masked,
@@ -1395,8 +1450,6 @@ def fit_model(
         shape_metric=shape_metric(binned.n_bsplines, binned.degree) if test == "parallel" else None,
         slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test == "parallel" else None,
         weights=weights,
-        weights_pred_0=None if weights is None else np.maximum(n_obs_grid[0], 1.0),
-        weights_pred_1=None if weights is None else np.maximum(n_obs_grid[1], 1.0),
         inference=inference,
         sample_index=sample_index,
         n_samples=n_samples,
@@ -1412,12 +1465,11 @@ def fit_model(
             shared,
             sample_defaults,
             ss_within=None if ss_within is None else ss_within[gene],
-            seeds=seeds[gene],
         )
-        for gene in binned.genes
+        for gene in fit_genes
     )
     if progressbar:
-        results = tqdm(results, total=len(binned.genes), desc="Fitting DiffSVG models")
+        results = tqdm(results, total=len(fit_genes), desc="Fitting DiffSVG models")
 
     stats_rows = []
     curve_rows = {}
@@ -1555,8 +1607,8 @@ def fit_profiles(
         raise ValueError("`fit_profiles` does not model slides; bin without `sample`.")
     B, _, _, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     weights, ss_within, n_obs_grid = _weighting(binned, use_binned)
-    seed = sample_defaults.get("random_seed") if predictive_seed is None else predictive_seed
-    seeds = dict(zip(binned.genes, _predictive_seeds(seed, len(binned.genes), per_gene=1), strict=True))
+    _warn_predictive_seed(predictive_seed)
+    fit_genes = _fittable_genes(binned.genes, Y)
     shared = _ProfileShared(
         B=B,
         n_bsplines=binned.n_bsplines,
@@ -1565,7 +1617,6 @@ def fit_profiles(
         B_pred=binned.B_pred,
         weights=weights,
         # One pooled curve: with conditions binned separately, a grid point holds both levels' cells.
-        weights_pred=None if weights is None else np.maximum(n_obs_grid.sum(axis=0), 1.0),
     )
 
     n_jobs = 1 if n_workers is None else n_workers
@@ -1577,9 +1628,8 @@ def fit_profiles(
             shared,
             sample_defaults,
             ss_within=None if ss_within is None else ss_within[gene],
-            seeds=seeds[gene],
         )
-        for gene in binned.genes
+        for gene in fit_genes
     )
     if progressbar:
         results = tqdm(results, total=len(binned.genes), desc="Fitting DiffSVG profiles")
@@ -1664,7 +1714,9 @@ def one_vs_rest(
         `adata.varm` prefixes written by `fit_model` / `fit_profiles`. An
         explicit `fit_profiles` result wins when both are present.
     null_quantile
-        Passed to `_compute_null_pvalues`.
+        Fraction of the "rest" genes assumed to follow the null: the Gamma
+        null is fitted to the lower `null_quantile` of their ``T`` values, as a
+        truncated sample (see `_gamma_null_pvalues`).
     inplace
         If `True`, also write the table to ``adata.varm[key_added]``
         (reindexed to ``adata.var_names``, so the probe gene's own row is
@@ -1678,8 +1730,10 @@ def one_vs_rest(
     pandas.DataFrame
         Indexed by the "rest" genes, with ``delta`` (the signed area between
         the probe curve and that gene's, negative when the probe sits below
-        it), ``T``, and the empirical/Gamma p-values with their BH-adjusted
-        counterparts.
+        it), ``T``, and the Gamma-null p-value ``gamma_pval`` with its
+        BH-adjusted ``gamma_pval_adj``. (The empirical p-value that used to be
+        here was circular: it always gave the top `1 - null_quantile` of the
+        genes the smallest possible p-value.)
     """
     profiles, source = _gene_profiles(adata, curves_key, profiles_key)
     if gene not in profiles.index:
@@ -1703,10 +1757,7 @@ def one_vs_rest(
         },
         index=rest.index,
     )
-    result["empirical_pval"], result["gamma_pval"] = _compute_null_pvalues(
-        result["T"].to_numpy(), null_quantile=null_quantile
-    )
-    result["empirical_pval_adj"] = _benjamini_hochberg(result["empirical_pval"].to_numpy())
+    result["gamma_pval"] = _gamma_null_pvalues(result["T"].to_numpy(), null_quantile=null_quantile)
     result["gamma_pval_adj"] = _benjamini_hochberg(result["gamma_pval"].to_numpy())
     result.attrs["probe_gene"] = gene
     result.attrs["profile_source"] = source
@@ -1721,15 +1772,18 @@ def one_vs_rest(
 # ============================================================
 
 
-def pattern_wald_test(pred0, pred1, ridge=1e-6):
-    """tradeSeq-like functional Wald test on posterior-predictive curves.
+def pattern_wald_test(pred0, pred1, ridge=0.0):
+    """tradeSeq-like functional Wald test that two curves are equal, from posterior draws of the curves.
+
+    Pass draws of the *mean* curves (as `fit_model` does): posterior-predictive draws add observation
+    noise to the covariance, which makes the test depend on how the data were binned.
 
     Parameters
     ----------
     pred0, pred1 : array, shape (n_draws, M)
-        Posterior-predictive draws of the two condition curves.
+        Posterior draws of the two condition curves.
     ridge : float
-        Diagonal regularization of the covariance.
+        Diagonal regularization of the covariance (relative to its largest eigenvalue).
 
     Returns
     -------
@@ -1746,18 +1800,20 @@ def pattern_wald_test(pred0, pred1, ridge=1e-6):
     mu = delta.mean(axis=0)
 
     Sigma = np.cov(delta, rowvar=False)
-    Sigma += ridge * np.eye(Sigma.shape[0])
-
-    # pseudoinverse over the non-singular directions, as in tradeSeq
     eigvals, eigvecs = np.linalg.eigh(Sigma)
-    keep = eigvals > 1e-8
+    if ridge:
+        eigvals = eigvals + ridge * eigvals.max()
+
+    # pseudoinverse over the directions the curves actually vary in (relative cutoff, so the
+    # degrees of freedom are the rank of the difference curve, not the number of grid points)
+    keep = eigvals > eigvals.max() * 1e-10
     eigvals = eigvals[keep]
     eigvecs = eigvecs[:, keep]
     Sigma_inv = eigvecs @ np.diag(1.0 / eigvals) @ eigvecs.T
 
     W = mu.T @ Sigma_inv @ mu
-    df = keep.sum()
-    pval = 1.0 - chi2.cdf(W, df)
+    df = int(keep.sum())
+    pval = float(chi2.sf(W, df))
     return W, pval, df, mu
 
 
