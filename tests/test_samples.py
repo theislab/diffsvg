@@ -57,7 +57,7 @@ def test_sample_must_be_nested_in_condition_and_needs_contiguous_bins():
     adata = _slides()
     dm = adata.obsm["design_matrix"]
     with pytest.raises(ValueError, match="window_radius"):
-        dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", sample="slide", inplace=False)
+        dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", sample="slide", window_radius=0.02, inplace=False)
     with pytest.raises(ValueError, match="needs a `condition`"):
         dvg.pp.bin_obs(adata, anchor="anchor", condition=None, sample="slide", window_radius=None, inplace=False)
     dm.loc[dm["slide"] == "s0", "condition"] = "b"  # move slide s0 to condition b ...

@@ -130,7 +130,7 @@ def _place_label(
 
 def _is_parallel_table(stats_df):
     """Whether `stats_df` comes from ``fit_model(..., test="parallel")`` rather than the Wald test."""
-    return "parallel_pval" in stats_df.columns and "gamma_pval" not in stats_df.columns
+    return "parallel_pval" in stats_df.columns
 
 
 _AXIS_LABELS = {
@@ -170,9 +170,10 @@ def plot_volcano(
         Column used for the y-axis, plotted as ``-log10(pvalue)``. Every
         point above the ``-log10(alpha)`` reference line is colored by the
         sign of `x` (blue = positive, red = negative); points at or below it
-        are black. Defaults to ``"gamma_pval"`` for the Wald test and
+        are black. Defaults to ``"wald_pval"`` for the Wald test and
         ``"parallel_pval"`` for ``test="parallel"``. p-values of exactly 0
-        (underflow) are drawn at the smallest non-zero one.
+        (underflow) are drawn at the smallest non-zero one; genes with a
+        missing p-value or `x` (e.g. not fitted) are left out.
     pvalue_adj
         Column used to rank genes for labeling (the `n_label` genes with the
         smallest `pvalue_adj` among those above the line get a text label).
@@ -216,7 +217,7 @@ def plot_volcano(
     if _is_parallel_table(stats_df):
         defaults = ("slope_diff", "parallel_pval", "parallel_pval_adj")
     else:
-        defaults = ("integral", "gamma_pval", "gamma_pval_adj")
+        defaults = ("integral", "wald_pval", "wald_pval_adj")
     x, pvalue, pvalue_adj = (
         given if given is not None else default
         for given, default in zip((x, pvalue, pvalue_adj), defaults, strict=True)
@@ -236,6 +237,11 @@ def plot_volcano(
     if missing:
         raise KeyError(f"highlight_genes not found in stats_df.index: {missing}")
 
+    # Missing p-values (genes that were not fitted) would otherwise be drawn as the most significant.
+    stats_df = stats_df[np.isfinite(stats_df[pvalue].to_numpy(dtype=float)) & np.isfinite(stats_df[x].to_numpy(dtype=float))]
+    missing = [g for g in highlight_genes if g not in stats_df.index]
+    if missing:
+        raise KeyError(f"highlight_genes have no p-value or `x`: {missing}")
     x_vals = stats_df[x]
     pvals = stats_df[pvalue].to_numpy(dtype=float)
     positive = pvals[pvals > 0]
@@ -436,7 +442,7 @@ def plot_pvalue_histogram(
     stats_df
         A statistics table indexed by gene, e.g. ``adata.varm["dsvg_stats"]``.
     pvalue
-        Column to histogram. Defaults to ``"empirical_pval"`` for the Wald
+        Column to histogram. Defaults to ``"wald_pval"`` for the Wald
         test and ``"parallel_pval"`` for ``test="parallel"``.
     bins
         Passed to `matplotlib.axes.Axes.hist`.
@@ -452,7 +458,7 @@ def plot_pvalue_histogram(
     matplotlib.axes.Axes
     """
     if pvalue is None:
-        pvalue = "parallel_pval" if _is_parallel_table(stats_df) else "empirical_pval"
+        pvalue = "parallel_pval" if _is_parallel_table(stats_df) else "wald_pval"
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 

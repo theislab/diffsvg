@@ -32,7 +32,7 @@ def bin_counts(
     category,
     design_matrix="design_matrix",
     n_bins=50,
-    window_radius=0.02,
+    window_radius=None,
     layer=None,
     drop_empty_bins=True,
 ):
@@ -58,8 +58,8 @@ def bin_counts(
     n_bins
         Number of bins spanning ``[0, 1]``; the grid has `n_bins` + 1 centers.
     window_radius
-        Half-width of the averaging window. Windows wider than ``0.5 / n_bins`` overlap. `None` makes them
-        contiguous: each cell counts once, in the bin of its nearest center.
+        Half-width of the averaging window. Windows wider than ``0.5 / n_bins`` overlap. `None` (default) makes
+        them contiguous: each cell counts once, in the bin of its nearest center.
     layer
         If given, bin ``adata.layers[layer]`` instead of ``adata.X``.
     drop_empty_bins
@@ -173,7 +173,7 @@ def build_spline_basis(x, interior_knots, degree=3):
         ``patsy.build_design_matrices([design_info], {"x": new_x})``.
     """
     dm = patsy.dmatrix(
-        f"center(bs(x, knots=interior_knots, degree={degree}, include_intercept=True)) - 1",
+        f"center(bs(x, knots=interior_knots, degree={degree}, include_intercept=True, lower_bound=0, upper_bound=1)) - 1",
         {"x": np.asarray(x), "interior_knots": np.asarray(interior_knots)},
     )
     return np.asarray(dm), dm.design_info
@@ -182,9 +182,8 @@ def build_spline_basis(x, interior_knots, degree=3):
 def _bspline_basis_01(x, n_bsplines, degree):
     """Uncentred B-spline basis with `bin_obs`'s knots, boundary knots pinned at ``0``/``1``.
 
-    `bin_obs` lets patsy take the boundary knots from the data, but its
-    prediction grid spans ``[0, 1]``, so for any `BinnedData` that exists they
-    are ``0`` and ``1``; pinning them here reproduces that basis for any `x`.
+    `build_spline_basis` pins the boundary knots at ``0`` and ``1`` too, so this reproduces
+    `bin_obs`'s basis for any `x`.
     """
     interior_knots = compute_interior_knots(n_bsplines, degree=degree)[1:-1]
     dm = patsy.dmatrix(
@@ -262,10 +261,12 @@ class BinnedData:
     sample, sample_labels, sample_index
         Only when binned with `sample`: the column, the samples that have rows, and per row its sample's
         index. Rows are then one per (sample, bin).
-    n_obs, n_obs_grid, ss_within
-        Only for contiguous bins (``window_radius=None``): cells per row, cells per grid point
-        (``n_categories x (n_bins + 1)``) and per gene the within-bin sum of squares. The fitters use them
-        to weight rows by cell count, so a binned fit matches a fit on the cells.
+    n_obs
+        Cells per row. The fitters weight rows by it.
+    n_obs_grid, ss_within
+        Only for contiguous bins (``window_radius=None``): cells per grid point
+        (``n_categories x (n_bins + 1)``) and per gene the within-bin sum of squares, so a binned fit
+        matches a fit on the cells.
     """
 
     genes: list
@@ -309,8 +310,23 @@ class BinnedData:
 
     @property
     def weighted(self):
-        """Whether the bins are contiguous with cell counts recorded, i.e. whether fits weight rows by them."""
-        return self.n_obs is not None
+        """Whether the bins are contiguous with the within-bin spread recorded, i.e. whether a binned fit
+        carries the same information as a fit on the cells. (Overlapping bins record `n_obs` too, and fits
+        weight rows by it, but their rows share cells.)"""
+        return self.ss_within is not None
+
+
+def _condition_levels(values):
+    """The levels of a condition column, in the order that fixes the 0/1 coding.
+
+    A categorical column keeps its category order (only categories that occur), anything else is sorted
+    as strings. Missing values are left out, as are the cells that hold them.
+    """
+    values = pd.Series(values)
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        observed = set(values.dropna().unique())
+        return [c for c in values.cat.categories if c in observed]
+    return sorted(pd.unique(values.dropna()), key=str)
 
 
 def bin_obs(
@@ -321,7 +337,7 @@ def bin_obs(
     n_bsplines=10,
     degree=3,
     n_bins=50,
-    window_radius=0.02,
+    window_radius=None,
     layer=None,
     design_matrix="design_matrix",
     inplace=True,
@@ -372,6 +388,10 @@ def bin_obs(
         bin, and records the cell counts and within-bin spread; the fitters
         then weight each bin by its cell count, so a binned fit matches a fit
         on the cells (needed for calibrated ``test="parallel"`` p-values).
+        `None` is the default. With overlapping windows the rows are still
+        weighted by how many cells they average (so a sparse edge window does
+        not count as much as a full one), but neighbouring rows stay
+        correlated and the p-values too small.
     layer
         If given, use ``adata.layers[layer]`` instead of ``adata.X``.
     design_matrix
@@ -408,9 +428,18 @@ def bin_obs(
     if missing:
         raise KeyError(f"Genes not found in adata.var_names: {sorted(missing)}")
 
+    anchor_values = design_matrix_df[anchor].to_numpy(dtype=float)
+    present = anchor_values[np.isfinite(anchor_values)]
+    if present.size and (present.min() < 0 or present.max() > 1):
+        raise ValueError(
+            f"`anchor` values must lie in [0, 1] (missing values are allowed and left out); "
+            f"got range [{present.min()}, {present.max()}]. Normalise the distances first, e.g. with "
+            "`squidpy.tl.var_by_distance`."
+        )
+
     levels = None
     if condition is not None:
-        levels = sorted(pd.unique(design_matrix_df[condition]), key=str)
+        levels = _condition_levels(design_matrix_df[condition])
         if len(levels) != 2:
             raise ValueError(f"`condition` column {condition!r} must have exactly two levels, found: {levels}")
 
@@ -484,9 +513,9 @@ def bin_obs(
     # value get -1.
     bin_assignment = _nearest_bin(design_matrix_df[anchor].to_numpy(dtype=float), n_bins)
 
-    n_obs = n_obs_grid = ss_within = None
+    n_obs = template["n_obs"].to_numpy(dtype=float)
+    n_obs_grid = ss_within = None
     if window_radius is None:
-        n_obs = template["n_obs"].to_numpy(dtype=float)
         codes = np.zeros(len(template), dtype=int) if condition is None else condition_fit.astype(int)
         n_obs_grid = np.zeros((1 if condition is None else 2, n_bins + 1))
         np.add.at(n_obs_grid, (codes, np.rint(anchor_vals * n_bins).astype(int)), n_obs)
