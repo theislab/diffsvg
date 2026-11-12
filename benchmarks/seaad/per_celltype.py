@@ -59,9 +59,9 @@ for name, cond in contrasts.items():
         print(f"rc=skip {sub} {name}: donors per group {per.to_dict()}", flush=True)
         continue
     a.obsm["design_matrix"] = pd.DataFrame({"depth": depth, "condition": cond, "donor": donor}, index=a.obs_names)
-    dvg.pp.bin_obs(a, anchor="depth", condition="condition", layer="lognorm", sample="donor")
+    dvg.pp.bin_obs(a, anchor="depth", condition="condition", layer="log1p", sample="donor")
     setup = dvg.tl.setup_model(a)
-    for test in ("level", "parallel"):
+    for test in ("level", "slope", "parallel"):
         t0 = time.perf_counter()
         stats, _, _ = dvg.tl.fit_model(a, setup, inplace=False, progressbar=False, test=test, tau=0.0)
         stats.to_csv(os.path.join(args.out, f"{safe}__{name}__{test}.csv"))

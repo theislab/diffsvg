@@ -1,5 +1,7 @@
 # SEA-AD MTG MERFISH benchmark
 
+**Correction (2026-11-12, afternoon):** the `lognorm` layer of the SpatialDataDB SEA-AD tables holds near-raw counts (maximum 516, correlation 0.48 with log1p of counts per 10k), not log-normalized values. Every result below that table used it. The analyses are being rerun on `log1p` = log1p(normalize_total(csc_counts)), and the numbers below are superseded until then.
+
 Data: SpatialDataDB study `seaad:MTG-MERFISH` (64 sections, 27 donors, 140 genes). The tables of all sections are concatenated into one h5ad with the `sddb` client (`Catalog().query().filter(study_id="seaad:MTG-MERFISH").to_list(elements=["tables/table"])`). The distance axis is `Normalized_depth_from_pia` (0 = pia, 1 = white matter), present for 321,226 cells. The replicate unit is the donor (`sample="donor"`; the sections of a donor are pooled).
 
 Contrasts: ADNC High + Intermediate (14 donors) vs Low + Not AD (13 donors); Dementia (10) vs No dementia (17); and five random donor splits with the ADNC group sizes, where no gene truly differs.

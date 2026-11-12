@@ -45,7 +45,7 @@ perm = rng.permutation(len(genes))
 effect = pd.Series(0.0, index=genes)
 for k, size in enumerate(SIZES):
     effect.iloc[perm[20 * k : 20 * (k + 1)]] = size
-X = a.layers["lognorm"]
+X = a.layers["log1p"]
 X = np.asarray(X.toarray() if issparse(X) else X, dtype=float)
 profile = (depth - 0.5) if args.kind == "shape" else np.ones_like(depth)
 X[in_a] += profile[in_a, None] * effect.to_numpy()[None, :]

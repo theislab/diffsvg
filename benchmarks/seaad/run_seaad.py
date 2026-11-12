@@ -24,7 +24,7 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--pooled", action="store_true", help="no donor effects (cells as replicates)")
 p.add_argument("--celltype", default=None, help="restrict to one seaad_class")
 p.add_argument("--tau", type=float, default=0.1)
-p.add_argument("--test", default="parallel", choices=["parallel", "level", "wald"])
+p.add_argument("--test", default="parallel", choices=["parallel", "level", "slope", "wald"])
 p.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
 p.add_argument("--data", default=os.path.expanduser("~/Documents/data/diffsvg/seaad_mtg_merfish.h5ad"))
 args = p.parse_args()
@@ -53,7 +53,7 @@ a.obsm["design_matrix"] = pd.DataFrame(
     index=a.obs_names,
 )
 t0 = time.perf_counter()
-dvg.pp.bin_obs(a, anchor="depth", condition="condition", layer="lognorm", sample=None if args.pooled else "donor")
+dvg.pp.bin_obs(a, anchor="depth", condition="condition", layer="log1p", sample=None if args.pooled else "donor")
 stats, _, _ = dvg.tl.fit_model(a, dvg.tl.setup_model(a), inplace=False, progressbar=False, tau=args.tau, test=args.test)
 dt = time.perf_counter() - t0
 tag = f"{args.contrast}{'' if args.contrast != 'null' else args.seed}_{'pooled' if args.pooled else 'donor'}{'_' + args.celltype.split(':')[-1].strip().replace(' ', '') if args.celltype else ''}{'' if args.tau == 0.1 else f'_tau{args.tau:g}'}{'' if args.test == 'parallel' else '_' + args.test}"
