@@ -142,12 +142,13 @@ def test_slides_stop_the_pooled_overconfidence():
     assert np.isfinite(curves["cond0_mean"].to_numpy()).all()
 
 
-def test_slide_aware_fits_refuse_the_wald_test_and_profiles():
+def test_slide_aware_fits_run_every_test_but_refuse_profiles():
     adata = _slides(n_per_slide=100)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
     setup = dvg.tl.setup_model(adata)
-    with pytest.raises(ValueError, match="only `test='parallel'`"):
-        dvg.tl.fit_model(adata, setup, test="wald", inplace=False)
+    for test in ("wald", "level"):
+        stats, _, _ = dvg.tl.fit_model(adata, setup, test=test, inplace=False, progressbar=False)
+        assert stats[f"{test}_df_denominator"].iloc[0] == 8
     with pytest.raises(ValueError, match="does not model slides"):
         dvg.tl.fit_profiles(adata, setup, inplace=False)
 

@@ -153,3 +153,24 @@ def test_stability_is_deterministic_with_exact_inference():
     )
     assert res.noise_floor == {"spearman": 1.0, "top_overlap": 1.0}
     assert not any("reseed" in label for label in res.similarity.index)
+
+
+def test_level_test_detects_a_level_shift_and_ignores_a_tilt():
+    rng = np.random.default_rng(0)
+    n = 6000
+    x = rng.random(n)
+    x[:4] = 0.0, 0.0, 1.0, 1.0
+    cond = np.where(np.arange(n) % 2 == 0, "a", "b")
+    b = (cond == "b").astype(float)
+    shifted = np.sin(3 * x) + 0.5 * b  # level difference 0.5, parallel curves
+    tilted = np.sin(3 * x) + 0.8 * b * (x - 0.5)  # zero mean difference, different shape
+    X = np.column_stack([shifted, tilted]) + 0.3 * rng.normal(size=(n, 2))
+    adata = ad.AnnData(X.astype(np.float32), var=pd.DataFrame(index=["shifted", "tilted"]))
+    adata.obsm["design_matrix"] = pd.DataFrame({"anchor": x, "condition": cond}, index=adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20)
+    setup = dvg.tl.setup_model(adata)
+    level, _, _ = dvg.tl.fit_model(adata, setup, test="level", inplace=False, progressbar=False)
+    shape, _, _ = dvg.tl.fit_model(adata, setup, test="parallel", inplace=False, progressbar=False)
+    assert level.loc["shifted", "level_pval"] < 1e-6 and level.loc["tilted", "level_pval"] > 0.05
+    assert shape.loc["tilted", "parallel_pval"] < 1e-6 and shape.loc["shifted", "parallel_pval"] > 0.05
+    assert abs(level.loc["shifted", "level_diff"] - 0.5) < 0.05

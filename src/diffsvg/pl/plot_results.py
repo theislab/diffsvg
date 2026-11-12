@@ -216,6 +216,8 @@ def plot_volcano(
     """
     if _is_parallel_table(stats_df):
         defaults = ("slope_diff", "parallel_pval", "parallel_pval_adj")
+    elif "level_pval" in stats_df.columns:
+        defaults = ("level_diff", "level_pval", "level_pval_adj")
     else:
         defaults = ("integral", "wald_pval", "wald_pval_adj")
     x, pvalue, pvalue_adj = (
@@ -458,7 +460,7 @@ def plot_pvalue_histogram(
     matplotlib.axes.Axes
     """
     if pvalue is None:
-        pvalue = "parallel_pval" if _is_parallel_table(stats_df) else "wald_pval"
+        pvalue = next(c for c in ("parallel_pval", "level_pval", "wald_pval") if c in stats_df.columns)
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 
