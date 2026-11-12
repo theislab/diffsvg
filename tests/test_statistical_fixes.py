@@ -130,3 +130,13 @@ def test_default_test_is_parallel():
 
     assert inspect.signature(dvg.tl.fit_model).parameters["test"].default == "parallel"
     assert inspect.signature(dvg.tl.check_stability).parameters["test"].default == "parallel"
+
+
+def test_bin_obs_warns_when_slides_are_ignored():
+    x = np.random.default_rng(0).random(2000)
+    x[[0, 1, 2, 3]] = 0.0, 0.0, 1.0, 1.0
+    adata = _adata(x)
+    cond = adata.obsm["design_matrix"]["condition"].to_numpy()
+    adata.obsm["design_matrix"]["slide"] = np.char.add(cond.astype(str), (np.arange(2000) % 3).astype(str))
+    with pytest.warns(UserWarning, match="sample='slide'"):
+        dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", inplace=False)
