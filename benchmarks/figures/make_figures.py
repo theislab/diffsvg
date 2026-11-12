@@ -67,13 +67,14 @@ for i, (label, pooled, aware) in enumerate(rows):
         ax.scatter(np.full(len(vals), i + offset), np.array(vals) * 100, s=10, color=INK, zorder=3, linewidth=0)
         ax.text(i + offset, max(np.max(vals), np.mean(vals)) * 100 + 3, f"{np.mean(vals) * 100:.0f}%", ha="center", va="bottom", fontsize=8, color=INK)
 ax.set_xticks(x, [r[0] for r in rows])
-ax.set_ylim(0, 100)
+ax.set_ylim(0, 110)
+ax.set_yticks([0, 20, 40, 60, 80, 100])
 ax.set_ylabel("genes called at FDR < 0.05 (%)")
 ax.set_title("Random splits of the replicates (no true difference)", fontsize=9, color=INK, loc="left")
 from matplotlib.patches import Patch
 
 ax.legend(handles=[Patch(color=ORANGE, label="cells as replicates (pooled)"), Patch(color=BLUE, label="replicate effects (diffsvg)")],
-          loc="upper right", fontsize=8)  # fmt: skip
+          loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=2, fontsize=8)  # fmt: skip
 save(fig, "fig1_calibration")
 
 # ---------------------------------------------------------------- 2. liver zonation curves
