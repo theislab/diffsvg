@@ -141,3 +141,19 @@ if files:
     fig.tight_layout()
     save(fig, "fig4_power")
 print("figures in", OUT)
+
+# ---------------------------------------------------------------- 5. liver per-donor slopes
+ds = pd.read_csv(liver / "donor_slopes.csv")
+genes = ["CYP2E1", "CYP1A2", "CYP3A4", "SDS", "ASS1"]
+fig, ax = plt.subplots(figsize=(5.0, 2.6))
+rng = np.random.default_rng(0)
+for i, g in enumerate(genes):
+    for cond, color, off in (("healthy", BLUE, -0.15), ("diseased", ORANGE, 0.15)):
+        v = ds.loc[ds.condition == cond, g].to_numpy()
+        ax.scatter(i + off + rng.uniform(-0.04, 0.04, len(v)), v, s=28, color=color, edgecolor="white", linewidth=1, zorder=3)
+ax.axhline(0, color=MUTED, lw=0.8)
+ax.set_xticks(range(len(genes)), genes)
+ax.set_ylabel("zonation slope per donor\n(log1p per 500 µm)")
+ax.set_title("One dot per donor: zonation gradients are flatter in fibrotic livers", fontsize=9, color=INK, loc="left")
+ax.legend(handles=[Patch(color=BLUE, label="healthy (3)"), Patch(color=ORANGE, label="fibrotic (4)")], fontsize=7, loc="lower left")
+save(fig, "fig5_liver_donor_slopes")
