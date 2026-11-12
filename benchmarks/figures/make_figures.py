@@ -162,8 +162,9 @@ save(fig, "fig5_liver_donor_slopes")
 from diffsvg.tl.model import _benjamini_hochberg as bh
 
 v = pd.read_csv(liver / "disease_donor_slope_tau0.csv", index_col=0)
-markers_pc = ["CYP2E1", "CYP1A2", "CYP3A4", "GLUL", "RHBG"]
-markers_pp = ["SDS", "ASS1", "HAL", "PCK1", "CPS1", "G6PC", "ALDOB", "SERPINA1"]
+# human zonation markers (Aizarani 2019, MacParland 2018, Halpern 2017); 10 of them are on this panel
+markers_pc = ["CYP2E1", "CYP1A2", "CYP3A4", "GLUL", "OAT", "CYP7A1"]
+markers_pp = ["SDS", "ASS1", "HAL", "PCK1", "CPS1", "HAMP", "ARG1", "G6PC"]
 mk = [g for g in markers_pc + markers_pp if g in v.index]
 v["marker_fdr"] = np.nan
 v.loc[mk, "marker_fdr"] = bh(v.loc[mk, "slope_pval"].to_numpy())
