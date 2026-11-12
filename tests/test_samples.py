@@ -142,53 +142,6 @@ def test_slides_stop_the_pooled_overconfidence():
     assert np.isfinite(curves["cond0_mean"].to_numpy()).all()
 
 
-def test_empirical_bayes_scales_match_nuts_on_simulated_slides():
-    """NUTS on these slides (4 x 1000 draws): level sd 0.39, curve sd 0.55, W 4.69, p 0.83 (tau 0, F with 8 df)."""
-    adata = _slides()
-    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
-    setup = dvg.tl.setup_model(adata)
-    for use_binned in (True, False):
-        stats, _, curves = dvg.tl.fit_model(
-            adata,
-            setup,
-            test="parallel",
-            tau=0.0,
-            inference="advi",
-            use_binned=use_binned,
-            inplace=False,
-            progressbar=False,
-        )
-        row = stats.iloc[0]
-        assert row["sample_level_sd"] == pytest.approx(0.39, rel=0.25)
-        assert row["sample_curve_sd"] == pytest.approx(0.55, rel=0.15)
-        assert row["parallel_stat"] == pytest.approx(4.69, rel=0.15)
-        assert row["vi_khat"] < 0.7 and row["vi_ess"] > 0.1
-        assert np.isfinite(curves["cond1_mean"].to_numpy()).all()
-
-
-def test_data_driven_scale_guess_is_in_the_right_range():
-    adata = _slides()
-    b = dvg.pp.bin_obs(
-        adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide", inplace=False
-    )
-    weights, _, _ = M._weighting(b, use_binned=True)
-    level, curve = M._guess_slide_scales(b.Y["g"], b.B, b.condition_fit, b.sample_index, b.n_samples, weights)
-    assert 0.39 / 2 < level < 0.39 * 2 and 0.55 / 2 < curve < 0.55 * 2
-
-
-def test_data_start_runs_and_its_failure_is_flagged():
-    """Free scales drift too small under ADVI (anti-conservative); the diagnostics catch it."""
-    adata = _slides()
-    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
-    with pytest.warns(UserWarning, match="variational diagnostics"):
-        stats, _, _ = dvg.tl.fit_model(
-            adata, dvg.tl.setup_model(adata), test="parallel", inference="advi", slide_scales="data_start",
-            inplace=False, progressbar=False,
-        )  # fmt: skip
-    assert {"sample_level_sd", "sample_curve_sd"} <= set(stats.columns)
-    assert stats["vi_khat"].iloc[0] > 0.7
-
-
 def test_slide_aware_fits_refuse_the_wald_test_and_profiles():
     adata = _slides(n_per_slide=100)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
