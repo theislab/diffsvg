@@ -846,13 +846,7 @@ def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
         delta_mean = A @ moments[0]
         level, var = float(a @ delta_mean), float(a @ A @ moments[1] @ A.T @ a)
     stat = level**2 / var
-    noncentrality = shared.tau**2 / var
-    if shared.df_denominator is None:
-        pval = float(ncx2.sf(stat, 1, noncentrality)) if shared.tau > 0 else float(chi2.sf(stat, 1))
-    elif shared.tau > 0:
-        pval = float(ncf.sf(stat, 1, shared.df_denominator, noncentrality))
-    else:
-        pval = float(f.sf(stat, 1, shared.df_denominator))
+    pval = _one_df_pval(stat, var, shared.tau, shared.df_denominator)
     low, high = (float(v) for v in np.quantile(level_draws, [0.03, 0.97]))
     row = {"level_diff": level, "level_diff_ci_low": low, "level_diff_ci_high": high, "level_stat": stat, "level_pval": pval}
     if shared.df_denominator is not None:
@@ -862,6 +856,51 @@ def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
 
 def _level_panel_stats(stats_df, null_quantile):
     stats_df["level_pval_adj"] = _benjamini_hochberg(stats_df["level_pval"].to_numpy())
+
+
+def _one_df_pval(stat, var, tau, df_denominator):
+    """p-value of ``stat = estimate^2 / var`` for ``H0: |effect| <= tau`` (1 df; F with slides)."""
+    noncentrality = tau**2 / var
+    if df_denominator is None:
+        return float(ncx2.sf(stat, 1, noncentrality)) if tau > 0 else float(chi2.sf(stat, 1))
+    if tau > 0:
+        return float(ncf.sf(stat, 1, df_denominator, noncentrality))
+    return float(f.sf(stat, 1, df_denominator))
+
+
+def _slope_gene_stats(draws0, draws1, idata, shared, moments=None):
+    """Test of the slope difference: the least-squares slope of ``f1 - f0`` over ``[0, 1]``, ``H0: |slope| <= tau``.
+
+    One degree of freedom, so with few replicates it has far more power than the ``K - 1`` df parallel test
+    for a gradient that steepens or flattens.
+    """
+    weights = shared.slope_weights
+    beta_1 = _posterior_draws(idata, "beta_1")
+    slope_draws = beta_1 @ weights
+    if moments is None:
+        slope, var = float(slope_draws.mean()), float(slope_draws.var(ddof=1))
+        delta_mean = (draws1 - draws0).mean(axis=0)
+    else:
+        b1 = slice(shared.n_bsplines + 2, 2 * shared.n_bsplines + 2)
+        slope, var = float(moments[0][b1] @ weights), float(weights @ moments[1][b1, b1] @ weights)
+        A0, A1 = _condition_maps(shared)
+        delta_mean = (A1 - A0) @ moments[0]
+    stat = slope**2 / var
+    low, high = (float(v) for v in np.quantile(slope_draws, [0.03, 0.97]))
+    row = {
+        "slope_diff": slope,
+        "slope_diff_ci_low": low,
+        "slope_diff_ci_high": high,
+        "slope_stat": stat,
+        "slope_pval": _one_df_pval(stat, var, shared.tau, shared.df_denominator),
+    }
+    if shared.df_denominator is not None:
+        row["slope_df_denominator"] = shared.df_denominator
+    return row, delta_mean
+
+
+def _slope_panel_stats(stats_df, null_quantile):
+    stats_df["slope_pval_adj"] = _benjamini_hochberg(stats_df["slope_pval"].to_numpy())
 
 
 def _wald_panel_stats(stats_df, null_quantile):
@@ -915,6 +954,7 @@ _TESTS = {
     "wald": (_wald_gene_stats, _wald_panel_stats),
     "parallel": (_parallel_gene_stats, _parallel_panel_stats),
     "level": (_level_gene_stats, _level_panel_stats),
+    "slope": (_slope_gene_stats, _slope_panel_stats),
 }
 
 
@@ -1110,6 +1150,15 @@ def fit_model(
           complement of ``"parallel"``, which ignores the level. Columns
           ``level_diff`` (with a 94% credible interval), ``level_stat``,
           ``level_pval`` and ``level_pval_adj``.
+        - ``"slope"``: whether the gap between the curves changes linearly
+          along the anchor, i.e. whether one gradient is steeper than the
+          other: the least-squares slope of ``f1 - f0`` over ``[0, 1]``,
+          ``H0: |slope| <= tau``, 1 degree of freedom. With few replicates it
+          has far more power than ``"parallel"`` (``n_bsplines - 1`` df) for
+          gradients that steepen or flatten, and it misses non-monotone
+          changes, which ``"parallel"`` covers. Columns ``slope_diff`` (with
+          a 94% credible interval), ``slope_stat``, ``slope_pval`` and
+          ``slope_pval_adj``.
 
         With data binned with `sample` (several slides per condition) the model has a random level and a
         random curve per slide, so the covariance of the interaction
@@ -1225,7 +1274,7 @@ def fit_model(
         test=test,
         tau=float(tau),
         shape_metric=shape_metric(binned.n_bsplines, binned.degree) if test == "parallel" else None,
-        slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test == "parallel" else None,
+        slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test in ("parallel", "slope") else None,
         weights=weights,
         inference=inference,
         sample_index=sample_index,
@@ -1259,7 +1308,7 @@ def fit_model(
 
     stats_df = pd.DataFrame(stats_rows).set_index("gene").reindex(binned.genes)
     _TESTS[test][1](stats_df, null_quantile)
-    test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level") else {"test": test}
+    test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level", "slope") else {"test": test}
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer

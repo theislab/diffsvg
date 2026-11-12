@@ -174,3 +174,19 @@ def test_level_test_detects_a_level_shift_and_ignores_a_tilt():
     assert level.loc["shifted", "level_pval"] < 1e-6 and level.loc["tilted", "level_pval"] > 0.05
     assert shape.loc["tilted", "parallel_pval"] < 1e-6 and shape.loc["shifted", "parallel_pval"] > 0.05
     assert abs(level.loc["shifted", "level_diff"] - 0.5) < 0.05
+
+
+def test_slope_test_detects_a_flattened_gradient():
+    rng = np.random.default_rng(0)
+    n = 6000
+    x = rng.random(n)
+    x[:4] = 0.0, 0.0, 1.0, 1.0
+    cond = np.where(np.arange(n) % 2 == 0, "a", "b")
+    b = (cond == "b").astype(float)
+    X = np.column_stack([x * (1 - 0.6 * b), x + 0.5 * b]) + 0.3 * rng.normal(size=(n, 2))  # flatter in b; parallel shift
+    adata = ad.AnnData(X.astype(np.float32), var=pd.DataFrame(index=["flattened", "shifted"]))
+    adata.obsm["design_matrix"] = pd.DataFrame({"anchor": x, "condition": cond}, index=adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20)
+    stats, _, _ = dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="slope", tau=0.0, inplace=False, progressbar=False)
+    assert stats.loc["flattened", "slope_pval"] < 1e-6 and stats.loc["shifted", "slope_pval"] > 0.05
+    assert abs(stats.loc["flattened", "slope_diff"] + 0.6) < 0.1
