@@ -24,15 +24,12 @@ classifiers = [
 ]
 dependencies = [
   "anndata>=0.13",
-  "arviz",
   "colorcet",
   "joblib>=1.3",
   "matplotlib",
   "numpy",
-  "nutpie",
   "pandas",
   "patsy",
-  "pymc",
   "scikit-learn",
   "scipy",
   # for debug logging (referenced from the issue template)
@@ -40,6 +37,13 @@ dependencies = [
   "tqdm",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
+# MCMC/variational inference (inference="nuts"/"advi"), only needed for non-normal coefficient priors or
+# to cross-check the exact posterior; the default (inference="auto" -> "exact") runs without them.
+optional-dependencies.pymc = [
+  "arviz",
+  "nutpie",
+  "pymc",
+]
 urls.Documentation = "https://diffsvg.readthedocs.io/"
 urls.Homepage = "https://github.com/theislab/diffsvg"
 urls.Source = "https://github.com/theislab/diffsvg"
@@ -49,6 +53,7 @@ dev = [
   "twine>=4.0.2",
 ]
 test = [
+  "diffsvg[pymc]",
   "coverage>=7.10",
   "pytest",
   "pytest-cov",     # For VS Code’s coverage functionality
