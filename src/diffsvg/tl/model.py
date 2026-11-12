@@ -1052,7 +1052,7 @@ def fit_model(
     null_quantile=0.9,
     sample_kwargs=None,
     test="parallel",
-    tau=0.1,
+    tau=None,
     predictive_seed=None,
     inference="auto",
     coefs_key="dsvg_coefs",
@@ -1177,11 +1177,13 @@ def fit_model(
         bins (``bin_obs(..., window_radius=None)``) and fits on the cells
         (``use_binned=False``) do not have that problem.
     tau
-        Only for ``test="parallel"``: the smallest shape difference that
-        counts, in the units of ``shape_diff`` (see `parallel_curves_test`).
-        The p-value tests ``shape_diff <= tau``, so smaller differences do
-        not become significant however many cells there are. ``0`` tests
-        whether the curves are exactly parallel.
+        For the ``"parallel"``, ``"level"`` and ``"slope"`` tests: the
+        smallest difference that counts (``shape_diff``, ``level_diff`` or
+        ``slope_diff``). The p-value tests ``|difference| <= tau``, so smaller
+        differences do not become significant however many cells there are.
+        Defaults to ``0.1`` for pooled data and to ``0`` for data binned with
+        `sample`, where the variation between slides already calibrates the
+        test and a positive `tau` only costs power.
     predictive_seed
         Deprecated, has no effect. The curves, their bands, ``integral`` and
         the Wald test are now computed from the posterior draws of the mean
@@ -1213,7 +1215,7 @@ def fit_model(
     """
     if test not in _TESTS:
         raise ValueError(f"Unknown test {test!r}. Available: {sorted(_TESTS)}")
-    if tau < 0:
+    if tau is not None and tau < 0:
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
     inference = _resolve_inference(inference, model_setup)
     if inference == "exact":
@@ -1242,6 +1244,8 @@ def fit_model(
     B, B_masked, condition_fit, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     weights, ss_within, n_obs_grid = _weighting(binned, use_binned)
     sample_index, n_samples = _sample_inputs(adata, binned, use_binned)
+    if tau is None:
+        tau = 0.0 if n_samples is not None else 0.1
     if n_samples is not None:
         if n_samples < 3:
             raise ValueError(f"Comparing conditions across slides needs at least 3 slides, found {n_samples}.")
