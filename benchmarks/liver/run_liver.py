@@ -68,7 +68,7 @@ dt = time.perf_counter() - t0
 tag = f"{args.contrast}{'' if args.contrast == 'disease' else args.seed}_{'pooled' if args.pooled else 'donor'}_{args.test}_tau{args.tau:g}"
 os.makedirs(args.out, exist_ok=True)
 stats.to_csv(os.path.join(args.out, f"{tag}.csv"))
-for k in ("cond0_mean", "cond1_mean"):
+for k in ("cond0_mean", "cond0_ci_low", "cond0_ci_high", "cond1_mean", "cond1_ci_low", "cond1_ci_high"):
     curves[k].to_csv(os.path.join(args.out, f"{tag}_{k}.csv"))
 donors_per = pd.DataFrame({"c": cond, "d": donor}).drop_duplicates().groupby("c").size().to_dict()
 col = f"{args.test}_pval_adj"
