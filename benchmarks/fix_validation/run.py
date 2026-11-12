@@ -28,12 +28,12 @@ if args.code == "old":
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-import scanpy as sc  # noqa: E402
-import squidpy as sq  # noqa: E402
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import squidpy as sq
 
-import diffsvg as dvg  # noqa: E402
+import diffsvg as dvg
 
 print("diffsvg from", dvg.__file__, flush=True)
 LAYER = "log1p_norm"
@@ -99,28 +99,46 @@ EXPERIMENTS = {
     "legnini_default": (legnini, "True", {}, {}),
     "legnini_parallel_pooled": (legnini, "True", {"window_radius": None}, {"test": "parallel", "tau": 0.1}),
     "legnini_parallel_slides": (
-        legnini, "True", {"window_radius": None, "sample": "sample"}, {"test": "parallel", "tau": 0.1}
+        legnini,
+        "True",
+        {"window_radius": None, "sample": "sample"},
+        {"test": "parallel", "tau": 0.1},
     ),
     "legnini_wald_weighted": (legnini, "True", {"window_radius": None}, {"test": "wald"}),
     "xenium_default": (xenium, "anchor", {}, {}),
     "xenium_parallel": (xenium, "anchor", {"window_radius": None}, {"test": "parallel", "tau": 0.1}),
     "synth_null_default": (synthetic_null, "anchor", {}, {"sample_kwargs": FAST}),
-    "synth_null_wald_weighted": (synthetic_null, "anchor", {"window_radius": None}, {"test": "wald", "sample_kwargs": FAST}),
+    "synth_null_wald_weighted": (
+        synthetic_null,
+        "anchor",
+        {"window_radius": None},
+        {"test": "wald", "sample_kwargs": FAST},
+    ),
     "synth_null_parallel": (
-        synthetic_null, "anchor", {"window_radius": None}, {"test": "parallel", "tau": 0.1, "sample_kwargs": FAST}
+        synthetic_null,
+        "anchor",
+        {"window_radius": None},
+        {"test": "parallel", "tau": 0.1, "sample_kwargs": FAST},
     ),
 }
 for s in range(3):
     EXPERIMENTS[f"legnini_null{s}_default"] = (lambda s=s: legnini_split_null(s), "True", {}, {"sample_kwargs": FAST})
     EXPERIMENTS[f"legnini_null{s}_wald_weighted"] = (
-        lambda s=s: legnini_split_null(s), "True", {"window_radius": None}, {"test": "wald", "sample_kwargs": FAST}
+        lambda s=s: legnini_split_null(s),
+        "True",
+        {"window_radius": None},
+        {"test": "wald", "sample_kwargs": FAST},
     )
     EXPERIMENTS[f"legnini_null{s}_parallel_pooled"] = (
-        lambda s=s: legnini_split_null(s), "True", {"window_radius": None},
+        lambda s=s: legnini_split_null(s),
+        "True",
+        {"window_radius": None},
         {"test": "parallel", "tau": 0.1, "sample_kwargs": FAST},
     )
     EXPERIMENTS[f"legnini_null{s}_parallel_slides"] = (
-        lambda s=s: legnini_split_null(s), "True", {"window_radius": None, "sample": "sample"},
+        lambda s=s: legnini_split_null(s),
+        "True",
+        {"window_radius": None, "sample": "sample"},
         {"test": "parallel", "tau": 0.1, "sample_kwargs": FAST},
     )
 
@@ -143,4 +161,7 @@ np.savez(
     grid=np.asarray(adata.uns["binned"].bin_centers if hasattr(adata.uns["binned"], "bin_centers") else []),
     **{k: v for k, v in curves.items() if v.dtype != object},
 )
-print(f"{args.code} {args.exp}: {elapsed:.0f} s, {len(stats)} genes, params {adata.uns.get('dsvg_stats_params')}", flush=True)
+print(
+    f"{args.code} {args.exp}: {elapsed:.0f} s, {len(stats)} genes, params {adata.uns.get('dsvg_stats_params')}",
+    flush=True,
+)

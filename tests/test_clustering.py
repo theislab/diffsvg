@@ -339,9 +339,7 @@ def _on_grid(adata, table):
 def test_fit_model_stores_the_coefficients_of_each_gene():
     adata = _simulated()
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20, window_radius=None)
-    dvg.tl.fit_model(
-        adata, dvg.tl.setup_model(adata), test="parallel", progressbar=False, n_workers=2
-    )
+    dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="parallel", progressbar=False, n_workers=2)
 
     beta, beta_1 = adata.varm["dsvg_coefs_beta"], adata.varm["dsvg_coefs_beta_1"]
     assert beta.shape == beta_1.shape == (2, K)
@@ -359,9 +357,7 @@ def test_fit_model_stores_the_coefficients_of_each_gene():
 def test_fit_model_without_inplace_returns_the_coefficients():
     adata = _simulated()
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20, window_radius=None)
-    _, _, tables = dvg.tl.fit_model(
-        adata, dvg.tl.setup_model(adata), test="parallel", inplace=False, progressbar=False
-    )
+    _, _, tables = dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="parallel", inplace=False, progressbar=False)
     assert list(tables["beta"].index) == ["tilted", "parallel"]
     assert list(tables["beta_1"].columns) == [f"B{k}" for k in range(K)]
     assert "dsvg_coefs_beta" not in adata.varm

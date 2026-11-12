@@ -39,6 +39,7 @@ def _require_pymc(inference):
             "The default inference='auto' uses the exact posterior wherever the model allows it."
         )
 
+
 # ============================================================
 # 1) Priors and likelihoods
 # ============================================================
@@ -470,6 +471,7 @@ def _quiet_pymc():
 # `_INFERENCE` maps a sampler name to a function that runs inside ``with model`` and returns the posterior as
 # `InferenceData` plus a dict of diagnostic columns. NUTS is only needed for non-normal coefficient priors.
 
+
 def _sample_nuts(model, sample_kwargs, diag_vars):
     """Sample the posterior with NUTS. `diag_vars` are the parameters the convergence diagnostics are reported for."""
     idata = pm.sample(**sample_kwargs)
@@ -675,7 +677,12 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
     results = []
     for i, gene in enumerate(genes):
         theta = res["draws"][i]
-        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        draws = {
+            "intercept": theta[:, 0],
+            "beta": theta[:, 1 : K + 1],
+            "categorical_beta": theta[:, K + 1],
+            "beta_1": theta[:, K + 2 :],
+        }
         fit_columns = {
             "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
             "sample_level_sd": float(res["level_sd_mean"][i]),
@@ -692,13 +699,20 @@ def _exact_gene_results(shared, Y, genes, ss_within, settings):
         return _exact_slide_results(shared, Y, genes, ss_within, settings)
     design = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
     names = ("intercept", "beta", "categorical_beta", "beta_1")
-    post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings)
+    post = _exact_fit(
+        design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings
+    )
     K = shared.n_bsplines
     seeds = np.random.SeedSequence(settings["random_seed"]).spawn(len(genes))
     results = []
     for i, gene in enumerate(genes):
         theta = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i]))
-        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        draws = {
+            "intercept": theta[:, 0],
+            "beta": theta[:, 1 : K + 1],
+            "categorical_beta": theta[:, K + 1],
+            "beta_1": theta[:, K + 2 :],
+        }
         fit_columns = {"sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
         results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(post.mean[i], post.cov[i])))
     return results
@@ -715,7 +729,11 @@ def _exact_profile_results(shared, Y, genes, ss_within, settings):
     for i, gene in enumerate(genes):
         curves = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i])) @ A.T
         ci_low, ci_high = np.quantile(curves, [0.03, 0.97], axis=0)
-        diag_row = {"gene": gene, "sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
+        diag_row = {
+            "gene": gene,
+            "sigma_mean": float(np.sqrt(post.sigma2_mean[i])),
+            "exact_edge_mass": float(post.edge_mass[i]),
+        }
         curve_row = {"mean": A @ post.mean[i], "ci_low": ci_low, "ci_high": ci_high, "beta": post.mean[i][1:],
                      "beta_cov": post.cov[i][1:, 1:]}  # fmt: skip
         results.append((gene, diag_row, curve_row))
@@ -848,7 +866,13 @@ def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
     stat = level**2 / var
     pval = _one_df_pval(stat, var, shared.tau, shared.df_denominator)
     low, high = (float(v) for v in np.quantile(level_draws, [0.03, 0.97]))
-    row = {"level_diff": level, "level_diff_ci_low": low, "level_diff_ci_high": high, "level_stat": stat, "level_pval": pval}
+    row = {
+        "level_diff": level,
+        "level_diff_ci_low": low,
+        "level_diff_ci_high": high,
+        "level_stat": stat,
+        "level_pval": pval,
+    }
     if shared.df_denominator is not None:
         row["level_df_denominator"] = shared.df_denominator
     return row, delta_mean
@@ -998,9 +1022,12 @@ def _warn_predictive_seed(predictive_seed):
 
 
 def _fittable_genes(genes, Y):
-    """The genes worth fitting. Genes whose fitted rows are constant (e.g. all zero) are left out with a
-    warning: the model reproduces them exactly, so the noise scale has no lower bound and the posterior
-    is improper (the sampler diverges and the test would be meaningless). Their stats stay missing."""
+    """The genes worth fitting.
+
+    Genes whose fitted rows are constant (e.g. all zero) are left out with a warning: the model reproduces
+    them exactly, so the noise scale has no lower bound and the posterior is improper (the sampler diverges
+    and the test would be meaningless). Their stats stay missing.
+    """
     degenerate = [g for g in genes if not np.isfinite(Y[g]).all() or np.ptp(np.asarray(Y[g], dtype=float)) == 0]
     if degenerate:
         shown = ", ".join(degenerate[:10]) + (" ..." if len(degenerate) > 10 else "")

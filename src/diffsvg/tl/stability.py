@@ -41,7 +41,9 @@ def _format_value(value):
     if isinstance(value, dict):  # a priors override
         # The full spec, not just the distribution name: two overrides of the same prior with different
         # parameters must get different run labels.
-        return "+".join(f"{name}:{spec[0]}({','.join(str(v) for v in spec[1:])})" for name, spec in sorted(value.items()))
+        return "+".join(
+            f"{name}:{spec[0]}({','.join(str(v) for v in spec[1:])})" for name, spec in sorted(value.items())
+        )
     return str(value)
 
 
@@ -288,8 +290,12 @@ def check_stability(
 
     reseed_labels = [label for label, _, _ in runs if label.endswith(")") and " (reseed " in label]
     noise_floor = {
-        "spearman": 1.0 if all_exact else (float(min(similarity.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
-        "top_overlap": 1.0 if all_exact else (float(min(top_overlap.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
+        "spearman": 1.0
+        if all_exact
+        else (float(min(similarity.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
+        "top_overlap": 1.0
+        if all_exact
+        else (float(min(top_overlap.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
     }
 
     sensitivity_rows = []
