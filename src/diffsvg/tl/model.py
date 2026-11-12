@@ -20,6 +20,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from scipy import optimize
 from scipy.stats import chi2, f, gamma, ncf, ncx2
+from scipy.stats import t as student_t
 from tqdm.auto import tqdm
 
 from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
@@ -878,6 +879,68 @@ def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
     return row, delta_mean
 
 
+def _two_stage_stats(shared, Y, genes, test, tau, ridge=1e-3):
+    """Two-stage test for data with slides: a curve per slide, then a comparison of the slides' summaries.
+
+    Stage 1 fits each slide's curve ``a_s + B(x) b_s`` by weighted least squares on its own rows (a small
+    ridge keeps it defined where a slide covers few grid points). Stage 2 compares a summary of these curves
+    between the conditions with every slide counted once: the level (mean over ``[0, 1]``) or the slope
+    (least-squares slope) by a two-sample t-test, the shape (the spline coefficients) by Hotelling's T^2.
+    This is the summary-statistics approach to repeated measures: it makes no assumption on how slides vary,
+    which the joint model's random curve (one scale for every spline direction) does.
+    """
+    n_s = shared.n_samples
+    X = np.column_stack([np.ones(len(shared.B)), shared.B])
+    w = np.ones(len(X)) if shared.weights is None else np.asarray(shared.weights, dtype=float)
+    Ymat = np.column_stack([np.asarray(Y[g], dtype=float) for g in genes])
+    coefs, cond = [], np.empty(n_s)
+    for s in range(n_s):
+        rows = np.asarray(shared.sample_index) == s
+        Xs, ws = X[rows], w[rows]
+        coefs.append(np.linalg.solve(Xs.T @ (ws[:, None] * Xs) + ridge * np.eye(X.shape[1]), Xs.T @ (ws[:, None] * Ymat[rows])))
+        cond[s] = np.asarray(shared.condition_fit)[rows][0]
+    coefs = np.stack(coefs)  # (slides, 1 + K, genes)
+    curves = np.einsum("pk,skg->spg", np.column_stack([np.ones(len(shared.B_pred)), shared.B_pred]), coefs)
+    g1, g0 = cond == 1, cond == 0
+    n1, n0 = int(g1.sum()), int(g0.sum())
+    df = n1 + n0 - 2
+    rows = {}
+    if test in ("level", "slope"):
+        a = _level_weights(shared.bin_centers)
+        if test == "level":
+            func = a
+        else:
+            xc = shared.bin_centers - a @ shared.bin_centers
+            func = a * xc / (a @ xc**2)
+        summ = np.einsum("p,spg->sg", func, curves)  # (slides, genes)
+        diff = summ[g1].mean(0) - summ[g0].mean(0)
+        pooled = (((summ[g1] - summ[g1].mean(0)) ** 2).sum(0) + ((summ[g0] - summ[g0].mean(0)) ** 2).sum(0)) / df
+        var = pooled * (1 / n1 + 1 / n0)
+        half = student_t.ppf(0.97, df) * np.sqrt(var)
+        for i, g in enumerate(genes):
+            stat = diff[i] ** 2 / var[i] if var[i] > 0 else np.inf
+            rows[g] = {
+                f"{test}_diff": diff[i], f"{test}_diff_ci_low": diff[i] - half[i], f"{test}_diff_ci_high": diff[i] + half[i],
+                f"{test}_stat": stat, f"{test}_pval": _one_df_pval(stat, var[i], tau, df) if var[i] > 0 else 0.0,
+                f"{test}_df_denominator": df,
+            }  # fmt: skip
+    elif test == "parallel":
+        K = coefs.shape[1] - 1
+        if df - K + 1 < 1:
+            raise ValueError(f"The two-stage shape test needs more than {K + 1} slides, found {n_s}; use test='slope'.")
+        for i, g in enumerate(genes):
+            b = coefs[:, 1:, i]
+            d = b[g1].mean(0) - b[g0].mean(0)
+            S = ((b[g1] - b[g1].mean(0)).T @ (b[g1] - b[g1].mean(0)) + (b[g0] - b[g0].mean(0)).T @ (b[g0] - b[g0].mean(0))) / df
+            T2 = float(d @ np.linalg.pinv(S) @ d) * n1 * n0 / (n1 + n0)
+            F = T2 * (df - K + 1) / (df * K)
+            rows[g] = {"parallel_stat": T2, "parallel_pval": float(f.sf(F, K, df - K + 1)), "parallel_df": K,
+                       "parallel_df_denominator": df - K + 1}  # fmt: skip
+    else:
+        return None
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
 def _level_panel_stats(stats_df, null_quantile):
     stats_df["level_pval_adj"] = _benjamini_hochberg(stats_df["level_pval"].to_numpy())
 
@@ -1083,6 +1146,7 @@ def fit_model(
     predictive_seed=None,
     inference="auto",
     coefs_key="dsvg_coefs",
+    two_stage=True,
     **pymc_kwargs,
 ):
     """Fit every per-gene model from `setup_model`, in parallel, and summarize the result.
@@ -1211,6 +1275,15 @@ def fit_model(
         Defaults to ``0.1`` for pooled data and to ``0`` for data binned with
         `sample`, where the variation between slides already calibrates the
         test and a positive `tau` only costs power.
+    two_stage
+        With data binned with `sample`: compute the test from one curve per
+        slide, comparing the slides' summaries between the conditions (level
+        or slope: t-test; shape: Hotelling's T^2; ``n_slides - 2``
+        denominator degrees of freedom). Every slide counts once and nothing
+        is assumed about how slides differ, so the error rate holds when the
+        joint model's random curve is misspecified. The fitted curves and
+        bands still come from the joint model. ``False`` uses the joint
+        model's posterior for the test as well.
     predictive_seed
         Deprecated, has no effect. The curves, their bands, ``integral`` and
         the Wald test are now computed from the posterior draws of the mean
@@ -1338,8 +1411,13 @@ def fit_model(
         curve_rows[gene] = curve_row
 
     stats_df = pd.DataFrame(stats_rows).set_index("gene").reindex(binned.genes)
+    if two_stage and n_samples is not None:
+        two = _two_stage_stats(shared, Y, list(fit_genes), test, tau)
+        if two is not None:
+            stats_df.loc[two.index, two.columns] = two
     _TESTS[test][1](stats_df, null_quantile)
     test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level", "slope") else {"test": test}
+    test_params["two_stage"] = bool(two_stage and n_samples is not None)
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer
