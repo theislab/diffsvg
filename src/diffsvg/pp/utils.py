@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import patsy
-from scipy.sparse import issparse
+from scipy.sparse import csr_matrix, issparse
 
 
 def _expression(adata, genes, layer):
@@ -77,44 +77,71 @@ def bin_counts(
     design_matrix = adata.obsm[design_matrix]
 
     genes = [genes] if isinstance(genes, str) else list(genes)
-    X = _expression(adata, genes, layer)
+    sub = adata[:, genes]
+    X = sub.layers[layer] if layer is not None else sub.X
+    X = csr_matrix(X, dtype=float) if issparse(X) else np.asarray(X, dtype=float)
 
-    value = design_matrix[anchor].values
+    value = np.asarray(design_matrix[anchor].values, dtype=float)
     # `category=None` bins along `anchor` alone, as one group.
     cat = np.zeros(len(value)) if category is None else np.asarray(design_matrix[category].values)
 
     bin_centers = np.linspace(0, 1, n_bins + 1)
     categories = np.unique(cat[~pd.isna(cat)])  # cells without a category (e.g. a slide without anchors) are left out
     contiguous = window_radius is None
-    nearest = _nearest_bin(value, n_bins) if contiguous else None
+    n_grid = n_bins + 1
 
-    meta_rows = []
-    avg_rows = []
-    ss_rows = []
-
-    for c in categories:
-        cat_mask = cat == c
-        for i, center in enumerate(bin_centers):
-            if contiguous:
-                lower = max(0.0, center - 0.5 / n_bins)
-                upper = min(1.0, center + 0.5 / n_bins)
-                mask = cat_mask & (nearest == i)
-            else:
-                lower = max(0.0, center - window_radius)
-                upper = min(1.0, center + window_radius)
-                mask = cat_mask & (value >= lower) & (value <= upper)
-            n_obs = int(mask.sum())
-            avg = X[mask].mean(axis=0) if n_obs else np.full(X.shape[1], np.nan)
-
-            meta_rows.append((c, center, lower, upper, n_obs))
-            avg_rows.append(avg)
-            if contiguous:
-                ss_rows.append(((X[mask] - avg) ** 2).sum(axis=0) if n_obs else np.full(X.shape[1], np.nan))
+    # One sparse indicator matrix (rows = (category, bin), columns = cells) replaces a pass over all cells per
+    # row: row means are M @ X / n and within-row sums of squares M @ X^2 - n * mean^2.
+    cat_code = np.full(len(value), -1)
+    for k, c in enumerate(categories):
+        cat_code[cat == c] = k
+    present = (cat_code >= 0) & np.isfinite(value)
+    if contiguous:
+        nearest = _nearest_bin(value, n_bins)
+        cells = np.flatnonzero(present)
+        rows = cat_code[cells] * n_grid + nearest[cells]
+        lower = np.maximum(0.0, bin_centers - 0.5 / n_bins)
+        upper = np.minimum(1.0, bin_centers + 0.5 / n_bins)
+    else:
+        lower = np.maximum(0.0, bin_centers - window_radius)
+        upper = np.minimum(1.0, bin_centers + window_radius)
+        row_parts, cell_parts = [], []
+        for k in range(len(categories)):
+            idx = np.flatnonzero(present & (cat_code == k))
+            order = idx[np.argsort(value[idx])]
+            sorted_vals = value[order]
+            starts = np.searchsorted(sorted_vals, lower, side="left")
+            ends = np.searchsorted(sorted_vals, upper, side="right")
+            for i in range(n_grid):
+                members = order[starts[i] : ends[i]]
+                row_parts.append(np.full(len(members), k * n_grid + i))
+                cell_parts.append(members)
+        rows = np.concatenate(row_parts) if row_parts else np.zeros(0, dtype=int)
+        cells = np.concatenate(cell_parts) if cell_parts else np.zeros(0, dtype=int)
+    M = csr_matrix((np.ones(len(rows)), (rows, cells)), shape=(len(categories) * n_grid, len(value)))
+    n_obs = np.asarray(M.sum(axis=1)).ravel()
+    sums = M @ X
+    sums = sums.toarray() if issparse(sums) else np.asarray(sums)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        avg = sums / n_obs[:, None]
+    avg[n_obs == 0] = np.nan
+    ss = None
+    if contiguous:
+        sq = M @ (X.multiply(X) if issparse(X) else X**2)
+        sq = sq.toarray() if issparse(sq) else np.asarray(sq)
+        ss = np.clip(sq - n_obs[:, None] * np.nan_to_num(avg) ** 2, 0.0, None)
+        ss[n_obs == 0] = np.nan
 
     meta_cols = ["_group" if category is None else category, anchor, "window_start", "window_end", "n_obs"]
-    meta = pd.DataFrame(meta_rows, columns=meta_cols)
-    avg = np.vstack(avg_rows)  # (n_meta_rows, n_genes)
-    ss = np.vstack(ss_rows) if contiguous else None
+    meta = pd.DataFrame(
+        {
+            meta_cols[0]: np.repeat(categories, n_grid),
+            anchor: np.tile(bin_centers, len(categories)),
+            "window_start": np.tile(lower, len(categories)),
+            "window_end": np.tile(upper, len(categories)),
+            "n_obs": n_obs.astype(int),
+        }
+    )
 
     if drop_empty_bins:
         keep = meta["n_obs"].to_numpy() > 0
