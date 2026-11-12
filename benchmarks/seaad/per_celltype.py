@@ -22,6 +22,8 @@ p.add_argument("--index", type=int, required=True)
 p.add_argument("--data", required=True)
 p.add_argument("--out", required=True)
 p.add_argument("--min-cells-per-donor", type=int, default=20)
+p.add_argument("--rescale", action="store_true", help="map the cell type's 2-98% depth range to [0, 1]")
+p.add_argument("--joint", action="store_true", help="joint-model test instead of the two-stage test")
 args = p.parse_args()
 
 full = ad.read_h5ad(args.data)
@@ -40,6 +42,9 @@ donor = a.obs["Donor_ID"].astype(str).to_numpy()
 adnc = a.obs["Overall_AD_neuropathological_Change"].astype(str).to_numpy()
 dementia = a.obs["Cognitive_Status"].astype(str).to_numpy()
 depth = a.obs["Normalized_depth_from_pia"].clip(0, 1).to_numpy()
+if args.rescale:  # the test averages over [0, 1]; without this a layer-restricted type leaves most of it empty
+    lo, hi = np.quantile(depth, [0.02, 0.98])
+    depth = np.clip((depth - lo) / (hi - lo), 0, 1)
 
 contrasts = {
     "adnc": np.where(np.isin(adnc, ["High", "Intermediate"]), "AD", "lowAD"),
@@ -63,7 +68,7 @@ for name, cond in contrasts.items():
     setup = dvg.tl.setup_model(a)
     for test in ("level", "slope", "parallel"):
         t0 = time.perf_counter()
-        stats, _, _ = dvg.tl.fit_model(a, setup, inplace=False, progressbar=False, test=test, tau=0.0)
+        stats, _, _ = dvg.tl.fit_model(a, setup, inplace=False, progressbar=False, test=test, tau=0.0, two_stage=not args.joint)
         stats.to_csv(os.path.join(args.out, f"{safe}__{name}__{test}.csv"))
         print(f"rc=0 {sub} {name} {test}: {a.n_obs} cells, donors {per.to_dict()}, {time.perf_counter() - t0:.0f} s, "
               f"BH<.05 {int((stats[test + '_pval_adj'] < .05).sum())}, p<.05 {int((stats[test + '_pval'] < .05).sum())}, "
