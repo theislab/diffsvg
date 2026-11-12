@@ -15,13 +15,9 @@ import os
 import warnings
 from dataclasses import dataclass
 
-import arviz as az
 import numpy as np
 import pandas as pd
-import pymc as pm
-import pytensor
 from joblib import Parallel, delayed
-from pymc.blocking import DictToArrayBijection, RaveledVars
 from scipy import optimize
 from scipy.special import logsumexp
 from scipy.stats import chi2, f, gamma, ncf, ncx2
@@ -30,6 +26,22 @@ from tqdm.auto import tqdm
 from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
 from diffsvg.tl import _exact
 
+try:  # the `pymc` extra: only needed for inference="nuts"/"advi"
+    import arviz as az
+    import pymc as pm
+    import pytensor
+    from pymc.blocking import DictToArrayBijection, RaveledVars
+except ImportError:
+    az = pm = pytensor = DictToArrayBijection = RaveledVars = None
+
+
+def _require_pymc(inference):
+    if pm is None:
+        raise ImportError(
+            f"inference={inference!r} needs PyMC, which is an optional dependency: pip install 'diffsvg[pymc]'. "
+            "The default inference='auto' uses the exact posterior wherever the model allows it."
+        )
+
 # ============================================================
 # 1) Priors and likelihoods
 # ============================================================
@@ -37,12 +49,12 @@ from diffsvg.tl import _exact
 # ``(distribution, *params)``, parameters in the order listed below.
 
 _PRIOR_DISTRIBUTIONS = {
-    "normal": (pm.Normal, ("mu", "sigma")),
-    "laplace": (pm.Laplace, ("mu", "b")),
-    "studentt": (pm.StudentT, ("nu", "mu", "sigma")),
-    "halfnormal": (pm.HalfNormal, ("sigma",)),
-    "halfcauchy": (pm.HalfCauchy, ("beta",)),
-    "exponential": (pm.Exponential, ("lam",)),
+    "normal": ("Normal", ("mu", "sigma")),
+    "laplace": ("Laplace", ("mu", "b")),
+    "studentt": ("StudentT", ("nu", "mu", "sigma")),
+    "halfnormal": ("HalfNormal", ("sigma",)),
+    "halfcauchy": ("HalfCauchy", ("beta",)),
+    "exponential": ("Exponential", ("lam",)),
 }
 
 #: Default priors; ``setup_model(priors=...)`` overrides any of them.
@@ -83,7 +95,8 @@ def _resolve_priors(priors):
 def _draw_prior(name, spec, shape=None, initval=None):
     """Instantiate one prior from its ``(distribution, *params)`` tuple."""
     distribution, *params = spec
-    dist, param_names = _PRIOR_DISTRIBUTIONS[distribution]
+    dist_name, param_names = _PRIOR_DISTRIBUTIONS[distribution]
+    dist = getattr(pm, dist_name)
     kwargs = dict(zip(param_names, params, strict=True))
     if shape is not None:
         kwargs["shape"] = shape
@@ -1316,9 +1329,10 @@ def _resolve_inference(inference, model_setup):
         raise ValueError(
             "inference='exact' needs the normal likelihood and normal priors on the coefficients; use 'nuts' or 'advi'."
         )
-    if inference == "auto":
-        return "exact" if ok else "nuts"
-    return inference
+    resolved = ("exact" if ok else "nuts") if inference == "auto" else inference
+    if resolved != "exact":
+        _require_pymc(resolved)
+    return resolved
 
 
 def _warn_predictive_seed(predictive_seed):
@@ -1776,6 +1790,8 @@ def fit_profiles(
     if inference == "exact" and not exact_ok:
         raise ValueError("inference='exact' needs the normal likelihood and normal priors on the coefficients.")
     inference = ("exact" if exact_ok else "nuts") if inference == "auto" else inference
+    if inference != "exact":
+        _require_pymc(inference)
     sample_defaults = {
         "nuts_sampler": "nutpie",
         "draws": 1000,
