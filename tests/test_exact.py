@@ -80,3 +80,25 @@ def test_exact_profiles_match_nuts():
     dvg.tl.fit_profiles(adata, setup, inference="exact", progressbar=False, profiles_key="ex")
     dvg.tl.fit_profiles(adata, setup, inference="nuts", progressbar=False, profiles_key="nu", sample_kwargs={"draws": 2000})
     np.testing.assert_allclose(adata.varm["ex_mean"], adata.varm["nu_mean"], atol=0.02)
+
+
+def test_exact_slides_match_nuts():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_samples import _slides
+
+    for shape_effect in (0.0, 1.5):
+        adata = _slides(shape_effect=shape_effect, seed=1)
+        dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20, sample="slide")
+        setup = dvg.tl.setup_model(adata)
+        exact, _, _ = dvg.tl.fit_model(adata, setup, inference="exact", inplace=False, progressbar=False)
+        nuts, _, _ = dvg.tl.fit_model(
+            adata, setup, inference="nuts", inplace=False, progressbar=False,
+            sample_kwargs={"draws": 2000, "tune": 2000, "chains": 4, "target_accept": 0.95},
+        )  # fmt: skip
+        np.testing.assert_allclose(exact["shape_diff"], nuts["shape_diff"], atol=0.05)
+        np.testing.assert_allclose(exact["parallel_pval"], nuts["parallel_pval"], atol=0.05)
+        np.testing.assert_allclose(exact["sample_level_sd"], nuts["sample_level_sd"], rtol=0.15)
+        assert exact["exact_edge_mass"].max() < 0.05
