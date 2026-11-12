@@ -1047,12 +1047,12 @@ def _summarise_gene(gene, idata, shared, fit_columns, moments=None):
 
 
 def _exact_settings(sample_kwargs):
-    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81}
+    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81, "n_hyper": 72}
     given = dict(sample_kwargs or {})
     ignored = sorted(set(given) - set(settings))
     if ignored:
         warnings.warn(
-            f"inference='exact' ignores the sampler settings {ignored} (it uses only draws, random_seed, n_grid).",
+            f"inference='exact' ignores the sampler settings {ignored} (it uses only draws, random_seed, n_grid, n_hyper).",
             UserWarning,
             stacklevel=3,
         )
@@ -1076,8 +1076,44 @@ def _exact_fit(design, Y, genes, weights, ss_within, priors, prior_names, n_bspl
     )
 
 
+def _exact_slide_results(shared, Y, genes, ss_within, settings):
+    """Exact inference for the two-condition model with slide effects."""
+    priors = _resolve_priors(shared.priors)
+    K = shared.n_bsplines
+    fixed = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
+    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples)
+    sizes = {"intercept": 1, "categorical_beta": 1, "beta": K, "beta_1": K}
+    names = ("intercept", "beta", "categorical_beta", "beta_1")
+    m0 = np.concatenate([[priors[n][1]] * sizes[n] for n in names])
+    s0 = np.concatenate([[priors[n][2]] * sizes[n] for n in names])
+    Ymat = np.column_stack([np.asarray(Y[g], dtype=float) for g in genes])
+    extra_df = extra_ss = None
+    if ss_within is not None:
+        extra_df = ss_within[genes[0]][1]
+        extra_ss = np.array([ss_within[g][0] for g in genes])
+    res = _exact.slide_posterior(
+        X, Ymat, shared.weights, fixed.shape[1], shared.n_samples, K, m0, s0, priors["sigma"],
+        priors["sample_level_sd"], priors["sample_curve_sd"], extra_df, extra_ss, n_draws=settings["draws"],
+        seeds=np.random.SeedSequence(settings["random_seed"]).spawn(len(genes)), n_hyper=settings.get("n_hyper", 72),
+    )  # fmt: skip
+    results = []
+    for i, gene in enumerate(genes):
+        theta = res["draws"][i]
+        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        fit_columns = {
+            "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
+            "sample_level_sd": float(res["level_sd_mean"][i]),
+            "sample_curve_sd": float(res["curve_sd_mean"][i]),
+            "exact_edge_mass": float(res["edge_mass"][i]),
+        }
+        results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(res["mean"][i], res["cov"][i])))
+    return results
+
+
 def _exact_gene_results(shared, Y, genes, ss_within, settings):
     """Exact inference for the two-condition model: ``[(gene, stats_row, curve_row), ...]``."""
+    if shared.sample_index is not None:
+        return _exact_slide_results(shared, Y, genes, ss_within, settings)
     design = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
     names = ("intercept", "beta", "categorical_beta", "beta_1")
     post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings)
@@ -1278,8 +1314,7 @@ def _resolve_inference(inference, model_setup):
     )
     if inference == "exact" and not ok:
         raise ValueError(
-            "inference='exact' needs the normal likelihood, normal priors on the coefficients and no `sample` "
-            "(slide effects); use 'nuts' or 'advi'."
+            "inference='exact' needs the normal likelihood and normal priors on the coefficients; use 'nuts' or 'advi'."
         )
     if inference == "auto":
         return "exact" if ok else "nuts"
