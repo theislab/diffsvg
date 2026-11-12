@@ -28,6 +28,7 @@ from scipy.stats import chi2, f, gamma, ncf, ncx2
 from tqdm.auto import tqdm
 
 from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
+from diffsvg.tl import _exact
 
 # ============================================================
 # 1) Priors and likelihoods
@@ -907,7 +908,12 @@ _INFERENCE = {
 
 
 def _posterior_draws(idata, name):
-    """Posterior draws of one variable, flattened over chains: ``(n_draws,)`` or ``(n_draws, dim)``."""
+    """Posterior draws of one variable, flattened over chains: ``(n_draws,)`` or ``(n_draws, dim)``.
+
+    `idata` is an `arviz.InferenceData` or, for exact inference, a dict ``{name: draws}``.
+    """
+    if isinstance(idata, dict):
+        return idata[name]
     values = idata.posterior[name].stack(sample=("chain", "draw")).to_numpy()
     return values.T if values.ndim == 2 else values
 
@@ -974,28 +980,54 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
                         "sample_level_sd": float(idata.posterior["sample_level_sd"].mean()),
                         "sample_curve_sd": float(idata.posterior["sample_curve_sd"].mean()),
                     }
-        # The condition curves are the posterior of the mean function on the grid (slide effects off, i.e.
-        # population level). No observation noise: the bands are credible bands of the curve, and the Wald
-        # test below sees the covariance of the coefficients rather than that of new observations.
-        draws0, draws1 = _mean_curve_draws(idata, shared)
+    return _summarise_gene(gene, idata, shared, fit_columns)
 
-        test_row, delta_mean = _TESTS[shared.test][0](draws0, draws1, idata, shared)
+
+def _condition_maps(shared):
+    """Linear maps from ``theta = (intercept, beta, categorical_beta, beta_1)`` to the two grid curves."""
+    n_grid, K = shared.B_pred.shape
+    ones = np.ones((n_grid, 1))
+    A0 = np.hstack([ones, shared.B_pred, shared.condition_pred_0[:, None], shared.B_pred_masked_0])
+    A1 = np.hstack([ones, shared.B_pred, shared.condition_pred_1[:, None], shared.B_pred_masked_1])
+    return A0, A1
+
+
+def _summarise_gene(gene, idata, shared, fit_columns, moments=None):
+    """Curves, test and summary columns of one gene from its posterior; see `_fit_and_predict_gene`.
+
+    `idata` holds the posterior draws (InferenceData or a dict). `moments` ``(mean, cov)`` of ``theta``
+    (exact inference) replace the draw estimates wherever only moments are needed: the means, the tests.
+    """
+    # The condition curves are the posterior of the mean function on the grid (slide effects off, i.e.
+    # population level). No observation noise: the bands are credible bands of the curve, and the Wald
+    # test sees the covariance of the coefficients rather than that of new observations.
+    draws0, draws1 = _mean_curve_draws(idata, shared)
+    test_row, delta_mean = _TESTS[shared.test][0](draws0, draws1, idata, shared, moments)
+    if moments is None:
         cond0_mean, cond1_mean = draws0.mean(axis=0), draws1.mean(axis=0)
-        cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
-        cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
-        integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
+    else:
+        A0, A1 = _condition_maps(shared)
+        cond0_mean, cond1_mean = A0 @ moments[0], A1 @ moments[0]
+    cond0_ci_low, cond0_ci_high = np.quantile(draws0, [0.03, 0.97], axis=0)
+    cond1_ci_low, cond1_ci_high = np.quantile(draws1, [0.03, 0.97], axis=0)
+    integral = float(np.trapezoid(delta_mean, x=shared.bin_centers))
 
-        # From the posterior directly: `az.summary`'s column names change across arviz versions.
-        post_cb = idata.posterior["categorical_beta"].to_numpy().ravel()
-        ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
-        beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
-        beta_1_mean = idata.posterior["beta_1"].mean(("chain", "draw")).to_numpy()
+    post_cb = _posterior_draws(idata, "categorical_beta")
+    ci_low, ci_high = (float(v) for v in np.quantile(post_cb, [0.03, 0.97]))
+    K = shared.n_bsplines
+    if moments is None:
+        cb_mean = float(post_cb.mean())
+        beta_mean = _posterior_draws(idata, "beta").mean(axis=0)
+        beta_1_mean = _posterior_draws(idata, "beta_1").mean(axis=0)
+    else:
+        cb_mean = float(moments[0][K + 1])
+        beta_mean, beta_1_mean = moments[0][1 : K + 1], moments[0][K + 2 :]
 
     stats_row = {
         "gene": gene,
         **test_row,
         "integral": integral,
-        "categorical_beta_mean": float(post_cb.mean()),
+        "categorical_beta_mean": cb_mean,
         "categorical_beta_ci_low": ci_low,
         "categorical_beta_ci_high": ci_high,
         **fit_columns,
@@ -1008,10 +1040,68 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
         "cond1_mean": cond1_mean,
         "cond1_ci_low": cond1_ci_low,
         "cond1_ci_high": cond1_ci_high,
-        "beta": beta_mean,
-        "beta_1": beta_1_mean,
+        "beta": np.asarray(beta_mean),
+        "beta_1": np.asarray(beta_1_mean),
     }
     return gene, stats_row, curve_row
+
+
+def _exact_settings(sample_kwargs):
+    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81}
+    settings.update(sample_kwargs or {})
+    unknown = set(settings) - {"draws", "random_seed", "n_grid"}
+    if unknown:
+        raise ValueError(f"Unknown settings for inference='exact': {sorted(unknown)} (allowed: draws, random_seed, n_grid)")
+    return settings
+
+
+def _exact_fit(design, Y, genes, weights, ss_within, priors, prior_names, n_bsplines, settings):
+    """`_exact.posterior` for all `genes` on the design `design` (columns ordered as `prior_names`)."""
+    Ymat = np.column_stack([np.asarray(Y[g], dtype=float) for g in genes])
+    XtWX, XtWY, yWy = _exact.sufficient_statistics(design, Ymat, weights)
+    sizes = {"intercept": 1, "categorical_beta": 1, "beta": n_bsplines, "beta_1": n_bsplines}
+    m0 = np.concatenate([[priors[n][1]] * sizes[n] for n in prior_names])
+    s0 = np.concatenate([[priors[n][2]] * sizes[n] for n in prior_names])
+    extra_df = extra_ss = None
+    if ss_within is not None:
+        extra_df = ss_within[genes[0]][1]
+        extra_ss = np.array([ss_within[g][0] for g in genes])
+    return _exact.posterior(
+        XtWX, XtWY, yWy, design.shape[0], m0, s0, priors["sigma"], extra_df, extra_ss, n_grid=settings["n_grid"]
+    )
+
+
+def _exact_gene_results(shared, Y, genes, ss_within, settings):
+    """Exact inference for the two-condition model: ``[(gene, stats_row, curve_row), ...]``."""
+    design = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
+    names = ("intercept", "beta", "categorical_beta", "beta_1")
+    post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings)
+    K = shared.n_bsplines
+    seeds = np.random.SeedSequence(settings["random_seed"]).spawn(len(genes))
+    results = []
+    for i, gene in enumerate(genes):
+        theta = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i]))
+        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        fit_columns = {"sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
+        results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(post.mean[i], post.cov[i])))
+    return results
+
+
+def _exact_profile_results(shared, Y, genes, ss_within, settings):
+    """Exact inference for the condition-free model: ``[(gene, diag_row, curve_row), ...]``."""
+    design = np.column_stack([np.ones(shared.B.shape[0]), shared.B])
+    post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors),
+                      ("intercept", "beta"), shared.n_bsplines, settings)  # fmt: skip
+    A = np.column_stack([np.ones(shared.B_pred.shape[0]), shared.B_pred])
+    seeds = np.random.SeedSequence(settings["random_seed"]).spawn(len(genes))
+    results = []
+    for i, gene in enumerate(genes):
+        curves = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i])) @ A.T
+        ci_low, ci_high = np.quantile(curves, [0.03, 0.97], axis=0)
+        diag_row = {"gene": gene, "sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
+        curve_row = {"mean": A @ post.mean[i], "ci_low": ci_low, "ci_high": ci_high, "beta": post.mean[i][1:]}
+        results.append((gene, diag_row, curve_row))
+    return results
 
 
 def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, ss_within=None):
@@ -1092,14 +1182,20 @@ def _benjamini_hochberg(pvals):
 # difference curve on the grid, and a panel part for what needs every gene.
 
 
-def _wald_gene_stats(draws0, draws1, idata, shared):
+def _wald_gene_stats(draws0, draws1, idata, shared, moments=None):
     """Wald test that the two condition curves are equal (level or shape), plus their `T` distance.
 
     `draws0`/`draws1` are posterior draws of the mean curves, so the covariance is that of the
     coefficients behind ``d(x) = f1(x) - f0(x)`` (rank ``n_bsplines``: the level plus the shape directions).
     """
-    wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
-    T = compute_T(draws0.mean(axis=0), draws1.mean(axis=0))
+    if moments is None:
+        wald_stat, wald_pval, wald_df, delta_mean = pattern_wald_test(draws0, draws1)
+    else:
+        A0, A1 = _condition_maps(shared)
+        A = A1 - A0
+        delta_mean = A @ moments[0]
+        wald_stat, wald_pval, wald_df = _wald_from_moments(delta_mean, A @ moments[1] @ A.T)
+    T = float(np.mean(delta_mean**2))
     return {"wald_stat": wald_stat, "wald_pval": wald_pval, "wald_df": wald_df, "T": T}, delta_mean
 
 
@@ -1109,12 +1205,23 @@ def _wald_panel_stats(stats_df, null_quantile):
     stats_df["wald_pval_adj"] = _benjamini_hochberg(stats_df["wald_pval"].to_numpy())
 
 
-def _parallel_gene_stats(draws0, draws1, idata, shared):
+def _parallel_gene_stats(draws0, draws1, idata, shared, moments=None):
     """`parallel_curves_test` on the posterior of `beta_1`, plus the linear slope of the difference curve."""
-    beta_1 = idata.posterior["beta_1"].stack(sample=("chain", "draw")).to_numpy().T  # (n_draws, K)
-    shape_diff, stat, df, pval = parallel_curves_test(
-        beta_1, shared.shape_metric, tau=shared.tau, df_denominator=shared.df_denominator
-    )
+    beta_1 = _posterior_draws(idata, "beta_1")  # (n_draws, K)
+    if moments is None:
+        shape_diff, stat, df, pval = parallel_curves_test(
+            beta_1, shared.shape_metric, tau=shared.tau, df_denominator=shared.df_denominator
+        )
+        delta_mean = (draws1 - draws0).mean(axis=0)
+    else:
+        K = shared.n_bsplines
+        b1 = slice(K + 2, 2 * K + 2)
+        shape_diff, stat, df, pval = parallel_curves_test(
+            moments[0][b1], shared.shape_metric, tau=shared.tau, cov=moments[1][b1, b1],
+            df_denominator=shared.df_denominator,
+        )  # fmt: skip
+        A0, A1 = _condition_maps(shared)
+        delta_mean = (A1 - A0) @ moments[0]
     slope = beta_1 @ shared.slope_weights
     slope_low, slope_high = (float(v) for v in np.quantile(slope, [0.03, 0.97]))
     row = {
@@ -1126,9 +1233,11 @@ def _parallel_gene_stats(draws0, draws1, idata, shared):
         "parallel_df": df,
         "parallel_pval": pval,
     }
+    if moments is not None:
+        row["slope_diff"] = float(moments[0][slice(shared.n_bsplines + 2, None)] @ shared.slope_weights)
     if shared.df_denominator is not None:
         row["parallel_df_denominator"] = shared.df_denominator
-    return row, (draws1 - draws0).mean(axis=0)
+    return row, delta_mean
 
 
 def _parallel_panel_stats(stats_df, null_quantile):
@@ -1150,6 +1259,26 @@ _COEF_NAMES = ("beta", "beta_1")
 def _coef_columns(n_bsplines):
     """Column labels of a coefficient table, one per spline basis function (strings, so they round-trip through h5ad)."""
     return [f"B{k}" for k in range(n_bsplines)]
+
+
+def _resolve_inference(inference, model_setup):
+    """``"auto"`` picks exact inference where the model allows it (see `_exact.supported`), NUTS otherwise."""
+    allowed = ("auto", "exact", *_INFERENCE)
+    if inference not in allowed:
+        raise ValueError(f"Unknown inference {inference!r}. Available: {sorted(allowed)}")
+    if model_setup is None:
+        return "nuts" if inference == "auto" else inference
+    ok = _exact.supported(
+        _resolve_priors(model_setup.priors), model_setup.likelihood, model_setup.binned.sample is not None
+    )
+    if inference == "exact" and not ok:
+        raise ValueError(
+            "inference='exact' needs the normal likelihood, normal priors on the coefficients and no `sample` "
+            "(slide effects); use 'nuts' or 'advi'."
+        )
+    if inference == "auto":
+        return "exact" if ok else "nuts"
+    return inference
 
 
 def _warn_predictive_seed(predictive_seed):
@@ -1219,7 +1348,7 @@ def fit_model(
     test="parallel",
     tau=0.1,
     predictive_seed=None,
-    inference="nuts",
+    inference="auto",
     coefs_key="dsvg_coefs",
     **pymc_kwargs,
 ):
@@ -1382,9 +1511,10 @@ def fit_model(
         raise ValueError(f"Unknown test {test!r}. Available: {sorted(_TESTS)}")
     if tau < 0:
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
-    if inference not in _INFERENCE:
-        raise ValueError(f"Unknown inference {inference!r}. Available: {sorted(_INFERENCE)}")
-    if inference == "nuts":
+    inference = _resolve_inference(inference, model_setup)
+    if inference == "exact":
+        sample_defaults = _exact_settings(sample_kwargs)
+    elif inference == "nuts":
         sample_defaults = {
             "nuts_sampler": "nutpie",
             "draws": 1000,
@@ -1399,8 +1529,9 @@ def fit_model(
         sample_defaults = dict(_VI_DEFAULTS)
         if model_setup is not None and model_setup.binned.sample is not None:
             sample_defaults.update(_VI_SLIDE_DEFAULTS)
-    sample_defaults.update(sample_kwargs or {})
-    sample_defaults.update(pymc_kwargs)
+    if inference != "exact":
+        sample_defaults.update(sample_kwargs or {})
+        sample_defaults.update(pymc_kwargs)
     if inference == "advi":
         _check_vi_settings(sample_defaults)
 
@@ -1457,17 +1588,20 @@ def fit_model(
     )
 
     n_jobs = 1 if n_workers is None else n_workers
-    results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
-        delayed(_fit_and_predict_gene)(
-            gene,
-            Y[gene],
-            intercept_initvals[gene],
-            shared,
-            sample_defaults,
-            ss_within=None if ss_within is None else ss_within[gene],
+    if inference == "exact":
+        results = _exact_gene_results(shared, Y, fit_genes, ss_within, sample_defaults)
+    else:
+        results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
+            delayed(_fit_and_predict_gene)(
+                gene,
+                Y[gene],
+                intercept_initvals[gene],
+                shared,
+                sample_defaults,
+                ss_within=None if ss_within is None else ss_within[gene],
+            )
+            for gene in fit_genes
         )
-        for gene in fit_genes
-    )
     if progressbar:
         results = tqdm(results, total=len(fit_genes), desc="Fitting DiffSVG models")
 
@@ -1548,6 +1682,7 @@ def fit_profiles(
     profiles_key="dsvg_profiles",
     sample_kwargs=None,
     predictive_seed=None,
+    inference="auto",
     **pymc_kwargs,
 ):
     """Fit the condition-free model for every gene, giving one expression profile per gene.
@@ -1589,6 +1724,18 @@ def fit_profiles(
     -------
     None or tuple[dict[str, pandas.DataFrame], pandas.DataFrame]
     """
+    if inference not in ("auto", "exact", "nuts"):
+        raise ValueError(f"Unknown inference {inference!r} for fit_profiles. Available: ['auto', 'exact', 'nuts']")
+    priors = _resolve_priors(model_setup.priors)
+    exact_ok = (
+        model_setup.likelihood == "normal"
+        and model_setup.binned.sample is None
+        and all(priors[n][0] == "normal" for n in ("intercept", "beta"))
+        and priors["sigma"][0] in _exact._SIGMA_LOGPDF
+    )
+    if inference == "exact" and not exact_ok:
+        raise ValueError("inference='exact' needs the normal likelihood and normal priors on the coefficients.")
+    inference = ("exact" if exact_ok else "nuts") if inference == "auto" else inference
     sample_defaults = {
         "nuts_sampler": "nutpie",
         "draws": 1000,
@@ -1599,8 +1746,11 @@ def fit_profiles(
         "init": "adapt_diag",
         "progressbar": False,
     }
-    sample_defaults.update(sample_kwargs or {})
-    sample_defaults.update(pymc_kwargs)
+    if inference == "exact":
+        sample_defaults = _exact_settings(sample_kwargs)
+    else:
+        sample_defaults.update(sample_kwargs or {})
+        sample_defaults.update(pymc_kwargs)
 
     binned = model_setup.binned
     if binned.sample is not None:
@@ -1620,17 +1770,20 @@ def fit_profiles(
     )
 
     n_jobs = 1 if n_workers is None else n_workers
-    results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
-        delayed(_fit_and_predict_profile)(
-            gene,
-            Y[gene],
-            intercept_initvals[gene],
-            shared,
-            sample_defaults,
-            ss_within=None if ss_within is None else ss_within[gene],
+    if inference == "exact":
+        results = _exact_profile_results(shared, Y, fit_genes, ss_within, sample_defaults)
+    else:
+        results = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator_unordered")(
+            delayed(_fit_and_predict_profile)(
+                gene,
+                Y[gene],
+                intercept_initvals[gene],
+                shared,
+                sample_defaults,
+                ss_within=None if ss_within is None else ss_within[gene],
+            )
+            for gene in fit_genes
         )
-        for gene in fit_genes
-    )
     if progressbar:
         results = tqdm(results, total=len(binned.genes), desc="Fitting DiffSVG profiles")
 
@@ -1799,22 +1952,24 @@ def pattern_wald_test(pred0, pred1, ridge=0.0):
     delta = pred1 - pred0  # (draws, M)
     mu = delta.mean(axis=0)
 
-    Sigma = np.cov(delta, rowvar=False)
+    W, pval, df = _wald_from_moments(mu, np.cov(delta, rowvar=False), ridge=ridge)
+    return W, pval, df, mu
+
+
+def _wald_from_moments(mu, Sigma, ridge=0.0):
+    """Wald statistic of ``mu`` against covariance `Sigma`, pseudoinverse over its non-null directions.
+
+    The cutoff is relative, so the degrees of freedom are the rank of the difference curve, not the
+    number of grid points. Returns ``(stat, pval, df)``.
+    """
     eigvals, eigvecs = np.linalg.eigh(Sigma)
     if ridge:
         eigvals = eigvals + ridge * eigvals.max()
-
-    # pseudoinverse over the directions the curves actually vary in (relative cutoff, so the
-    # degrees of freedom are the rank of the difference curve, not the number of grid points)
     keep = eigvals > eigvals.max() * 1e-10
-    eigvals = eigvals[keep]
-    eigvecs = eigvecs[:, keep]
-    Sigma_inv = eigvecs @ np.diag(1.0 / eigvals) @ eigvecs.T
-
-    W = mu.T @ Sigma_inv @ mu
+    z = eigvecs[:, keep].T @ mu
+    W = float((z**2 / eigvals[keep]).sum())
     df = int(keep.sum())
-    pval = float(chi2.sf(W, df))
-    return W, pval, df, mu
+    return W, float(chi2.sf(W, df)), df
 
 
 def _shape_grid(n_bsplines, degree, n_grid):
