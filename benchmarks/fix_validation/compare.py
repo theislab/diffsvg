@@ -42,8 +42,13 @@ for f in sorted(R.glob("*.csv")):
 print(pd.DataFrame(rows).T.sort_index().fillna("").to_markdown())
 
 section("Regression: same explicit configuration, old vs new (parallel test)")
-for exp in ("legnini_parallel_pooled", "legnini_parallel_slides", "xenium_parallel", "synth_null_parallel",
-            "legnini_null0_parallel_slides"):
+for exp in (
+    "legnini_parallel_pooled",
+    "legnini_parallel_slides",
+    "xenium_parallel",
+    "synth_null_parallel",
+    "legnini_null0_parallel_slides",
+):
     o, n = load("old", exp), load("new", exp)
     if o is None or n is None:
         continue
@@ -51,8 +56,10 @@ for exp in ("legnini_parallel_pooled", "legnini_parallel_slides", "xenium_parall
     for col in ("parallel_stat", "parallel_pval", "shape_diff", "slope_diff", "integral"):
         a, b = o.loc[common, col], n.loc[common, col]
         ok = a.notna() & b.notna()
-        print(f"{exp:32s} {col:14s} max|diff| {np.abs(a[ok] - b[ok]).max():.3g}  "
-              f"spearman {a[ok].corr(b[ok], method='spearman'):.4f}  n={ok.sum()}")
+        print(
+            f"{exp:32s} {col:14s} max|diff| {np.abs(a[ok] - b[ok]).max():.3g}  "
+            f"spearman {a[ok].corr(b[ok], method='spearman'):.4f}  n={ok.sum()}"
+        )
 
 section("Old default vs new default: rank agreement and known biology (Legnini)")
 o, n = load("old", "legnini_default"), load("new", "legnini_default")
@@ -61,8 +68,13 @@ if o is not None and n is not None:
     n_rank = n["parallel_stat"].rank(ascending=False)
     print("spearman(old T rank, new parallel_stat rank):", round(o_rank.corr(n_rank, method="spearman"), 3))
     present = [g for g in SHH_TARGETS + DORSAL if g in n.index]
-    tab = pd.DataFrame({"old rank (T)": o_rank[present], "new rank": n_rank[present],
-                        "new BH": n["parallel_pval_adj"][present].round(4)})
+    tab = pd.DataFrame(
+        {
+            "old rank (T)": o_rank[present],
+            "new rank": n_rank[present],
+            "new BH": n["parallel_pval_adj"][present].round(4),
+        }
+    )
     print(tab.to_markdown())
     print("old top 15:", ", ".join(o_rank.nsmallest(15).index))
     print("new top 15:", ", ".join(n_rank.nsmallest(15).index))
@@ -76,9 +88,13 @@ if xen:
     sc.pp.log1p(a)
     mean_expr = pd.Series(np.asarray(a.X.mean(axis=0)).ravel(), index=a.var_names)
     quint = pd.qcut(mean_expr.rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
-    for code, exp, col in (("old", "xenium_default", "empirical_pval_adj"), ("old", "xenium_default", "gamma_pval_adj"),
-                           ("old", "xenium_parallel", "parallel_pval_adj"), ("new", "xenium_default", "parallel_pval_adj"),
-                           ("new", "xenium_parallel", "parallel_pval_adj")):
+    for code, exp, col in (
+        ("old", "xenium_default", "empirical_pval_adj"),
+        ("old", "xenium_default", "gamma_pval_adj"),
+        ("old", "xenium_parallel", "parallel_pval_adj"),
+        ("new", "xenium_default", "parallel_pval_adj"),
+        ("new", "xenium_parallel", "parallel_pval_adj"),
+    ):
         df = load(code, exp)
         if df is None or col not in df:
             continue

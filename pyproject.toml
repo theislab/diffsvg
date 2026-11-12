@@ -1,10 +1,9 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = [ "hatchling" ]
+requires = [ "hatch-vcs", "hatchling" ]
 
 [project]
 name = "diffsvg"
-version = "0.0.1"
 description = "Differential spatially variable genes"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -22,6 +21,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Typing :: Typed",
 ]
+dynamic = [ "version" ]
 dependencies = [
   "anndata>=0.13",
   "colorcet",
@@ -36,14 +36,14 @@ dependencies = [
   "session-info2",
   "tqdm",
 ]
-# https://docs.pypi.org/project_metadata/#project-urls
-# MCMC/variational inference (inference="nuts"/"advi"), only needed for non-normal coefficient priors or
-# to cross-check the exact posterior; the default (inference="auto" -> "exact") runs without them.
+# MCMC inference (inference="nuts"), only needed for non-normal coefficient priors or to cross-check the
+# exact posterior; the default (inference="auto" -> "exact") runs without it.
 optional-dependencies.pymc = [
   "arviz",
   "nutpie",
   "pymc",
 ]
+# https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://diffsvg.readthedocs.io/"
 urls.Homepage = "https://github.com/theislab/diffsvg"
 urls.Source = "https://github.com/theislab/diffsvg"
@@ -53,8 +53,8 @@ dev = [
   "twine>=4.0.2",
 ]
 test = [
-  "diffsvg[pymc]",
   "coverage>=7.10",
+  "diffsvg[pymc]",
   "pytest",
   "pytest-cov",     # For VS Code’s coverage functionality
 ]
@@ -81,6 +81,7 @@ typecheck = [
 ]
 
 [tool.hatch]
+version.source = "vcs"
 envs.default.installer = "uv"
 envs.default.dependency-groups = [ "dev" ]
 envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
@@ -142,7 +143,8 @@ lint.ignore = [
   "E741", # allow I, O, l as variable names -> I is the identity matrix
 ]
 lint.per-file-ignores."*/__init__.py" = [ "F401" ]
-lint.per-file-ignores."docs/*" = [ "I" ]
+lint.per-file-ignores."benchmarks/*" = [ "D103", "E402" ]  # scripts set thread env vars before importing numpy
+lint.per-file-ignores."docs/*" = [ "D103", "E402", "I" ]
 lint.per-file-ignores."tests/*" = [ "D" ]
 lint.pydocstyle.convention = "numpy"
 
@@ -151,7 +153,7 @@ files = [ "src", "tests" ]
 overrides = [
   # These don't ship a `py.typed` marker and have no stub-only package on
   # PyPI, so mypy has no way to type-check calls into them regardless.
-  { module = [ "arviz.*", "joblib.*", "patsy.*", "pymc.*" ], ignore_missing_imports = true },
+  { module = [ "arviz.*", "joblib.*", "patsy.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
 ]
 
 [tool.pytest]

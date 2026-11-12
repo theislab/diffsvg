@@ -243,7 +243,9 @@ def plot_volcano(
         raise KeyError(f"highlight_genes not found in stats_df.index: {missing}")
 
     # Missing p-values (genes that were not fitted) would otherwise be drawn as the most significant.
-    stats_df = stats_df[np.isfinite(stats_df[pvalue].to_numpy(dtype=float)) & np.isfinite(stats_df[x].to_numpy(dtype=float))]
+    stats_df = stats_df[
+        np.isfinite(stats_df[pvalue].to_numpy(dtype=float)) & np.isfinite(stats_df[x].to_numpy(dtype=float))
+    ]
     missing = [g for g in highlight_genes if g not in stats_df.index]
     if missing:
         raise KeyError(f"highlight_genes have no p-value or `x`: {missing}")

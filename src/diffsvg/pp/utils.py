@@ -338,9 +338,11 @@ class BinnedData:
 
     @property
     def weighted(self):
-        """Whether the bins are contiguous with the within-bin spread recorded, i.e. whether a binned fit
-        carries the same information as a fit on the cells. (Overlapping bins record `n_obs` too, and fits
-        weight rows by it, but their rows share cells.)"""
+        """Whether the bins are contiguous and record the within-bin spread.
+
+        Then a binned fit carries the same information as a fit on the cells. (Overlapping bins record
+        `n_obs` too, and fits weight rows by it, but their rows share cells.)
+        """
         return self.ss_within is not None
 
 

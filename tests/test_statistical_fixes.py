@@ -117,7 +117,11 @@ def test_volcano_leaves_out_unfitted_genes():
 
     matplotlib.use("Agg")
     df = pd.DataFrame(
-        {"slope_diff": [0.5, -0.3, np.nan], "parallel_pval": [1e-4, 0.2, np.nan], "parallel_pval_adj": [1e-3, 0.3, np.nan]},
+        {
+            "slope_diff": [0.5, -0.3, np.nan],
+            "parallel_pval": [1e-4, 0.2, np.nan],
+            "parallel_pval_adj": [1e-3, 0.3, np.nan],
+        },
         index=["a", "b", "unfitted"],
     )
     ax = dvg.pl.plot_volcano(df, n_label=None)

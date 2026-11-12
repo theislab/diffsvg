@@ -25,8 +25,11 @@ _SIGMA_LOGPDF = {
 
 
 def supported(priors, likelihood, has_samples):
-    """Whether the exact posterior applies: Gaussian likelihood and normal coefficient priors (with slides, any
-    one-dimensional positive prior on the two slide scales)."""
+    """Whether the exact posterior applies.
+
+    It needs a Gaussian likelihood and normal coefficient priors (with slides, any one-dimensional positive
+    prior on the two slide scales).
+    """
     coefficient_priors = ("intercept", "beta", "beta_1", "categorical_beta")
     scales = ("sigma", "sample_level_sd", "sample_curve_sd") if has_samples else ("sigma",)
     return (
@@ -158,7 +161,9 @@ def draws(post, gene, n_draws, rng):
     s_idx = rng.choice(post.grid_weights.shape[1], size=n_draws, p=post.grid_weights[gene])
     s2 = np.exp(2.0 * post.log_sigma_grid[gene, s_idx])[:, None]  # (n, 1)
     d = post.eigvals[None, :]
-    u = post.projected[:, gene][None, :] / (d + s2) + np.sqrt(s2 / (d + s2)) * rng.standard_normal((n_draws, d.shape[1]))
+    u = post.projected[:, gene][None, :] / (d + s2) + np.sqrt(s2 / (d + s2)) * rng.standard_normal(
+        (n_draws, d.shape[1])
+    )
     return post.prior_mean[None, :] + u @ post.transform.T
 
 
