@@ -44,6 +44,8 @@ Choose from the options below to install diffsvg:
    pip install git+https://github.com/theislab/diffsvg.git  # (or `uv add`)
    ```
 
+The default inference is exact and needs no sampler. To use NUTS (`inference="nuts"`, only needed for non-normal priors), install the optional extra: `pip install "diffsvg[pymc] @ git+https://github.com/theislab/diffsvg.git"`.
+
 ## Release notes
 
 See the [changelog][].

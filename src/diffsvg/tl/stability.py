@@ -15,7 +15,8 @@ from tqdm.auto import tqdm
 
 from diffsvg.pp.utils import bin_obs
 
-from .model import DiffSVGModelSetup, fit_model, setup_model
+from . import _exact
+from .model import DiffSVGModelSetup, _resolve_priors, fit_model, setup_model
 
 #: Parameters that need `bin_obs` re-run; the others only need a refit.
 _BIN_PARAMS = ("n_bsplines", "degree", "n_bins", "window_radius", "layer")
@@ -121,6 +122,7 @@ def check_stability(
     test="parallel",
     tau=0.1,
     sample=None,
+    inference="auto",
 ):
     """Re-rank genes under every combination in `grid` and measure how much the ranking moves.
 
@@ -160,7 +162,9 @@ def check_stability(
         Size of the "top genes" set used for the overlap metric.
     n_seeds
         How many times to run the baseline, each with a different
-        `random_seed`, to establish the noise floor. `1` skips it.
+        `random_seed`, to establish the noise floor. `1` skips it. Ignored
+        when every run uses exact inference: the statistics are then
+        deterministic and the noise floor is 1.
     n_workers, progressbar, sample_kwargs
         As in `fit_model`; `sample_kwargs` is where to make the sweep
         cheaper (e.g. ``{"draws": 300, "tune": 300}``), since ranking needs
@@ -170,6 +174,8 @@ def check_stability(
         Seed for the gene subsample.
     test, tau
         Which condition test every run uses, as in `fit_model`.
+    inference
+        Passed to `fit_model`.
     sample
         Passed to `diffsvg.pp.bin_obs`: the slide column for data with several
         slides per condition, so every run uses the model with slide effects
@@ -220,7 +226,14 @@ def check_stability(
 
     baseline_label = label_for(baseline_config)
     runs = [(label_for(config), config, base_seed) for config in configs]
-    runs += [(f"{baseline_label} (reseed {i})", baseline_config, base_seed + i) for i in range(1, max(1, int(n_seeds)))]
+    # Exact inference has no Monte Carlo error, so reseeding would only repeat the same run.
+    all_exact = inference in ("auto", "exact") and all(
+        _exact.supported(_resolve_priors(c["priors"]), c["likelihood"], sample is not None) for c in configs
+    )
+    if not all_exact:
+        runs += [
+            (f"{baseline_label} (reseed {i})", baseline_config, base_seed + i) for i in range(1, max(1, int(n_seeds)))
+        ]
     labels = [label for label, _, _ in runs]
     if len(set(labels)) != len(labels):
         raise ValueError(f"Two runs got the same label, which would merge their results: {labels}")
@@ -256,6 +269,7 @@ def check_stability(
                 sample_kwargs={**sample_kwargs, "random_seed": seed},
                 test=test,
                 tau=tau,
+                inference=inference,
             )
             columns[label] = stats_df[rank_by]
             if iterator is not None:
@@ -274,8 +288,8 @@ def check_stability(
 
     reseed_labels = [label for label, _, _ in runs if label.endswith(")") and " (reseed " in label]
     noise_floor = {
-        "spearman": float(min(similarity.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan"),
-        "top_overlap": float(min(top_overlap.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan"),
+        "spearman": 1.0 if all_exact else (float(min(similarity.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
+        "top_overlap": 1.0 if all_exact else (float(min(top_overlap.loc[baseline_label, reseed_labels])) if reseed_labels else float("nan")),
     }
 
     sensitivity_rows = []

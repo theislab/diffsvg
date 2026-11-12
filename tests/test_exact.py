@@ -126,3 +126,30 @@ def test_exact_runs_without_pymc():
         "    raise AssertionError('nuts ran without pymc')\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_one_vs_rest_separates_shape_from_level():
+    """Same shape at another level is not a difference; another shape is."""
+    rng = np.random.default_rng(0)
+    n = 6000
+    x = rng.random(n)
+    x[:2] = 0.0, 1.0
+    probe = np.sin(3 * x)
+    X = np.column_stack([probe, probe + 2.0, np.cos(4 * x), probe]) + 0.3 * rng.normal(size=(n, 4))
+    adata = ad.AnnData(X.astype(np.float32), var=pd.DataFrame(index=["probe", "shifted", "other", "same"]))
+    adata.obsm["design_matrix"] = pd.DataFrame({"anchor": x}, index=adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition=None, n_bins=20)
+    dvg.tl.fit_profiles(adata, dvg.tl.setup_model(adata), progressbar=False)
+    res = dvg.tl.one_vs_rest(adata, "probe")
+    assert res.loc["other", "parallel_pval"] < 1e-6
+    assert res.loc["shifted", "parallel_pval"] > 0.05
+    assert res.loc["same", "parallel_pval"] > 0.05
+
+
+def test_stability_is_deterministic_with_exact_inference():
+    adata = _adata(n=2000)
+    res = dvg.tl.check_stability(
+        adata, anchor="anchor", condition="condition", grid={"n_bins": [10, 20]}, genes=None, progressbar=False
+    )
+    assert res.noise_floor == {"spearman": 1.0, "top_overlap": 1.0}
+    assert not any("reseed" in label for label in res.similarity.index)

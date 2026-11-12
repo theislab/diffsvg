@@ -19,20 +19,17 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from scipy import optimize
-from scipy.special import logsumexp
 from scipy.stats import chi2, f, gamma, ncf, ncx2
 from tqdm.auto import tqdm
 
 from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
 from diffsvg.tl import _exact
 
-try:  # the `pymc` extra: only needed for inference="nuts"/"advi"
+try:  # the `pymc` extra: only needed for inference="nuts"
     import arviz as az
     import pymc as pm
-    import pytensor
-    from pymc.blocking import DictToArrayBijection, RaveledVars
 except ImportError:
-    az = pm = pytensor = DictToArrayBijection = RaveledVars = None
+    az = pm = None
 
 
 def _require_pymc(inference):
@@ -178,8 +175,8 @@ def _build_gene_model(
     - `weights` (cells per row) and `ss_within` (``(within-row sum of squares, n_cells - n_rows)``) come
       from contiguous bins: rows are weighted by their cell count and the noise is the cell-level one.
       `weights` lives in a ``"w_data"`` container so predictions can set it per grid point.
-    - `record_mu` keeps the row-wise mean as the ``"mu"`` deterministic (one value per row and draw, so
-      ADVI leaves it out).
+    - `record_mu` keeps the row-wise mean as the ``"mu"`` deterministic (one value per row and draw; off
+      in `fit_model`, nothing reads it).
     - `sample_index` (the slide of every row) adds a non-centred random level and random curve per slide,
       ``sample_level_sd * z_level[slide] + B @ (sample_curve_sd * z_curve[slide])``, multiplied by a
       ``"sample_on"`` container that a prediction grid sets to 0 for the population-level curves.
@@ -468,395 +465,10 @@ def _quiet_pymc():
 
 
 # ------------------------------------------------------------
-# Posterior inference: NUTS, or full-rank ADVI
+# Posterior inference by sampling (the exact path lives in `diffsvg.tl._exact`)
 # ------------------------------------------------------------
-# `fit_model(..., inference=...)` picks one of `_INFERENCE`. Each runs inside ``with model`` and returns the
-# posterior as `InferenceData` plus a dict of diagnostic columns.
-#
-# ADVI is full-rank and starts at the Laplace approximation (mode and inverse Hessian on the unconstrained scale):
-# the spline coefficients have a long, thin, tilted posterior that plain `pm.fit` from a unit Gaussian does not
-# reach on single cells, and mean-field cannot represent it. The shape test is built on that covariance.
-# See .claude/advi_plan.md.
-
-#: Settings of ``inference="advi"``, overridable through `fit_model`'s `sample_kwargs`.
-#:
-#: - ``n``: Adam steps after the Laplace start (0 returns the Laplace approximation itself).
-#: - ``learning_rate``, ``final_learning_rate``: decayed exponentially over ``n``; small, since the start is close.
-#: - ``obj_n_mc``: Monte Carlo samples per gradient.
-#: - ``draws``: draws from the fitted approximation.
-#: - ``init``: ``"laplace"``, or ``None`` for PyMC's unit-Gaussian start (not recommended).
-#: - ``diagnostic_draws``: draws for the importance-ratio diagnostics (0 skips them).
-#: - ``random_seed``.
-#: - ``slide_scales``: only with `sample`: ``"empirical_bayes"`` (see `_empirical_bayes_scales`) or
-#:   ``"data_start"`` (scales stay random, started at `_guess_slide_scales`).
-_VI_DEFAULTS = {
-    "n": 2000,
-    "learning_rate": 1e-3,
-    "final_learning_rate": 1e-5,
-    "obj_n_mc": 1,
-    "draws": 4000,
-    "init": "laplace",
-    "diagnostic_draws": 1000,
-    "random_seed": 42,
-    "slide_scales": "empirical_bayes",
-}
-
-#: Overrides of `_VI_DEFAULTS` for data binned with `sample`. With ~100-200 parameters the default polish adds more
-#: noise than it removes (simulated slides: the importance ESS share falls to 0.05 at 1e-3 and stays at 0.45 at 1e-4,
-#: with the same Wald statistic as NUTS either way), so the steps are ten times smaller.
-_VI_SLIDE_DEFAULTS = {"learning_rate": 1e-4, "final_learning_rate": 1e-6}
-#: Smallest acceptable ``vi_ess`` without / with slides. The share falls with the number of parameters even for a good
-#: approximation (simulated slides, ~130 parameters: 0.45 while matching NUTS), so with slides only a collapse counts.
-_VI_MIN_ESS = {False: 0.5, True: 0.1}
-
-
-def _check_vi_settings(settings):
-    """Fail on a mistyped setting (or one that belongs to NUTS) before any gene is fitted."""
-    unknown = sorted(set(settings) - set(_VI_DEFAULTS))
-    if unknown:
-        raise ValueError(f"Unknown setting(s) for inference='advi': {unknown}. Available: {sorted(_VI_DEFAULTS)}")
-    if settings["init"] not in ("laplace", None):
-        raise ValueError(f"`init` must be 'laplace' or None, got {settings['init']!r}.")
-    if settings["n"] < 0 or settings["draws"] < 2:
-        raise ValueError("`n` must be >= 0 and `draws` >= 2.")
-    if settings["learning_rate"] <= 0 or settings["final_learning_rate"] <= 0:
-        raise ValueError("the learning rates must be positive.")
-    if settings["slide_scales"] not in _SLIDE_SCALE_METHODS:
-        raise ValueError(f"`slide_scales` must be one of {_SLIDE_SCALE_METHODS}, got {settings['slide_scales']!r}.")
-
-
-class _FlatDensity:
-    """A model's log density and its gradient on the unconstrained scale, as functions of one flat vector.
-
-    The vector has the order of ADVI's parameters (the value variables of the
-    model, ravelled one after the other), so a point found here can serve as
-    the mean of the approximation as it is. The density is the one ADVI is
-    fitted to: it includes the Jacobians of the transforms (``sigma`` is
-    sampled as ``log(sigma)``).
-    """
-
-    def __init__(self, model):
-        self.start = DictToArrayBijection.map(model.initial_point())
-        self._logp = model.compile_logp(jacobian=True)
-        self._dlogp = model.compile_dlogp(jacobian=True)
-
-    def _point(self, x):
-        return DictToArrayBijection.rmap(RaveledVars(x, self.start.point_map_info))
-
-    @property
-    def names(self):
-        return [name for name, *_ in self.start.point_map_info]
-
-    def logp(self, x):
-        return float(self._logp(self._point(x)))
-
-    def dlogp(self, x):
-        return np.asarray(self._dlogp(self._point(x)), dtype=float)
-
-
-def _inverse_psd(precision, floor=1e-10):
-    """Inverse of a symmetric matrix, with eigenvalues below `floor` times the largest lifted to it."""
-    values, vectors = np.linalg.eigh(precision)
-    if values.max() <= 0:
-        raise ValueError("the Hessian of the log density has no positive direction at its mode.")
-    values = np.maximum(values, floor * values.max())
-    return (vectors / values) @ vectors.T
-
-
-def _mode(density, start=None, free=None, newton_steps=3, step=1e-6):
-    """Mode of a density over the `free` coordinates (the others held at `start`), and the precision there.
-
-    L-BFGS finds the mode roughly, a few Newton steps refine it - the
-    posterior is thin, so L-BFGS alone stops early along the narrow
-    directions - and the Hessian comes from central differences of the
-    analytic gradient, which needs no second-order graph to compile.
-    Returns ``(x, precision)``: the full flat vector and minus the Hessian
-    of the log density over the free coordinates.
-    """
-    x = np.array(density.start.data if start is None else start, dtype=float)
-    free = np.arange(len(x)) if free is None else np.asarray(free)
-
-    def at(values):
-        point = x.copy()
-        point[free] = values
-        return point
-
-    def precision(values):
-        # minus the Hessian of the log density, one column per free parameter
-        out = np.empty((len(free), len(free)))
-        for a, j in enumerate(free):
-            h = np.zeros(len(x))
-            h[j] = step * max(1.0, abs(values[a]))
-            out[:, a] = (density.dlogp(at(values) - h)[free] - density.dlogp(at(values) + h)[free]) / (2 * h[j])
-        return (out + out.T) / 2
-
-    result = optimize.minimize(
-        lambda v: (-density.logp(at(v)), -density.dlogp(at(v))[free]),
-        x[free],
-        jac=True,
-        method="L-BFGS-B",
-        options={"maxiter": 5000, "ftol": 1e-14, "gtol": 1e-8},
-    )
-    values = result.x
-    for _ in range(newton_steps):
-        proposal = values + np.linalg.solve(precision(values), density.dlogp(at(values))[free])
-        if not density.logp(at(proposal)) >= density.logp(at(values)):
-            break
-        values = proposal
-    return at(values), precision(values)
-
-
-def _laplace(density, start=None, free=None):
-    """Mode and covariance of a density (its Laplace approximation) on the unconstrained scale; see `_mode`."""
-    x, precision = _mode(density, start, free)
-    return x, _inverse_psd(precision)
-
-
-def _tril_params(cov):
-    """`FullRank`'s ``L_tril`` for a covariance: its Cholesky factor, lower triangle ravelled, diagonal before the softplus."""
-    chol = np.linalg.cholesky(cov)
-    diag = np.diag(chol)
-    chol[np.diag_indices_from(chol)] = np.where(diag > 30.0, diag, np.log(np.expm1(np.minimum(diag, 30.0))))
-    return chol[np.tril_indices(len(chol))]
-
-
-def _gpd_shape(x):
-    """Shape of a generalized Pareto distribution fitted to sorted, positive exceedances `x`.
-
-    The empirical-Bayes fit of Zhang and Stephens (2009), with the weakly
-    informative prior on the shape (towards 0.5) of Vehtari et al. (2024).
-    """
-    n = len(x)
-    quartile = x[int(n / 4 + 0.5) - 1]
-    if quartile <= x[0]:  # far from any Pareto tail: a few draws carry all the weight
-        return np.inf
-    m = 30 + int(np.sqrt(n))
-    b = (1 - np.sqrt(m / (np.arange(1, m + 1) - 0.5))) / (3 * quartile) + 1 / x[-1]
-    k = np.log1p(-b[:, None] * x).mean(axis=1)
-    profile = n * (np.log(-b / k) - k - 1)
-    weight = np.exp(profile - logsumexp(profile))
-    keep = weight >= 10 * np.finfo(float).eps
-    b_mean = (b[keep] * weight[keep]).sum() / weight[keep].sum()
-    shape = np.log1p(-b_mean * x).mean()
-    return (n * shape + 10 * 0.5) / (n + 10)
-
-
-def _pareto_k(weights):
-    """Pareto k-hat of importance weights: the tail index of their largest values (Vehtari et al., 2024).
-
-    Importance sampling has a finite variance when it is below 0.5 and is
-    still usable up to about 0.7.
-    """
-    w = np.sort(weights)
-    n_tail = int(min(0.2 * len(w), 3 * np.sqrt(len(w))))
-    if n_tail < 5:
-        return np.nan
-    tail = w[-n_tail:] - w[-n_tail - 1]
-    if tail[-1] <= tail[0]:  # all tail weights equal, i.e. the approximation is exact
-        return np.nan
-    return float(_gpd_shape(tail))
-
-
-def _importance_diagnostics(density, mean, cov, n_draws, seed):
-    """How far a Gaussian approximation is from the density it was fitted to, from importance ratios (Yao et al., 2018).
-
-    Draws from the approximation and weighs each draw by density over
-    approximation. Returns ``(k, ess)``: the Pareto k-hat of the weights - an
-    approximation that is too narrow somewhere has heavy-tailed ratios, and
-    above about 0.7 it should not be trusted - and their effective sample size
-    as a share of the draws, which a covariance that is too wide or an
-    off-centre mean lose as well (below about 0.5 the covariance is more than
-    ~25% off, and with it the Wald statistic built on it).
-    """
-    chol = np.linalg.cholesky(cov)
-    z = np.random.default_rng(seed).standard_normal((n_draws, len(mean)))
-    # The Gaussian's normalizing constant is left out: it shifts all log-weights alike, and neither diagnostic sees it.
-    log_q = -0.5 * (z**2).sum(axis=1) - np.log(np.diag(chol)).sum()
-    log_w = np.array([density.logp(mean + chol @ zi) for zi in z]) - log_q
-    w = np.exp(log_w - log_w.max())
-    return _pareto_k(w), float(w.sum() ** 2 / (w**2).sum() / n_draws)
-
-
-# ------------------------------------------------------------
-# Slides with ADVI
-# ------------------------------------------------------------
-# With `bin_obs(sample=...)` the slide effects are non-centred (``scale * z``), and the joint mode of
-# (z, log scale), where a plain Laplace start would sit, is far from the posterior (simulated slides: scales
-# 1.3 / 2.3 vs 0.40 / 0.55, W 0.15 vs NUTS's 4.6). The ``slide_scales`` setting picks the way around it:
-# - "empirical_bayes": fix the scales at the mode of their marginal posterior, slide effects integrated out by a
-#   Laplace approximation (as lme4/TMB do), then the usual Laplace start + ADVI.
-# - "data_start": keep the scales random and start ADVI at a least-squares guess of them.
-
-#: The slide scales (value variables) and the standard-normal slide effects each one multiplies.
-_SLIDE_SCALES = {"sample_level_sd_log__": "sample_level_z", "sample_curve_sd_log__": "sample_curve_z"}
-_SLIDE_SCALE_METHODS = ("empirical_bayes", "data_start")
-#: Standard deviation of the log-scales in the starting approximation of ``slide_scales="data_start"``.
-_DATA_START_LOG_SCALE_SD = 0.3
-
-
-def _blocks(density):
-    """Index range of every named variable in the flat vector of a `_FlatDensity`."""
-    out, start = {}, 0
-    for name, _, size, _ in density.start.point_map_info:
-        out[name] = np.arange(start, start + size)
-        start += size
-    return out
-
-
-def _guess_slide_scales(y, B, condition, sample_index, n_samples, weights=None, ridge=1e-3):
-    """Rough slide scales by least squares, as a starting point (assumes the Normal likelihood).
-
-    Fits the pooled model, then each slide's residuals with a level and a spline curve, and returns the
-    RMS of those levels and of those curve coefficients (biased upwards by noise, fine for a start).
-    """
-    y = np.asarray(y, dtype=float)
-    w = np.ones(len(y)) if weights is None else np.asarray(weights, dtype=float)
-
-    def solve(X, target, w_rows):
-        return np.linalg.solve(
-            (X * w_rows[:, None]).T @ X + ridge * np.eye(X.shape[1]), (X * w_rows[:, None]).T @ target
-        )
-
-    X = np.column_stack([np.ones(len(y)), B, condition, B * condition[:, None]])
-    residual = y - X @ solve(X, y, w)
-    levels, curves = [], []
-    for j in range(n_samples):
-        rows = np.asarray(sample_index) == j
-        coef = solve(np.column_stack([np.ones(rows.sum()), B[rows]]), residual[rows], w[rows])
-        levels.append(coef[0])
-        curves.append(coef[1:])
-    return (
-        max(float(np.sqrt(np.mean(np.square(levels)))), 1e-2),
-        max(float(np.sqrt(np.mean(np.square(curves)))), 1e-2),
-    )
-
-
-def _expansion_optimum(log_scales, expansion):
-    """The slide effects maximizing the expanded log density at `log_scales`, and their prior precision there."""
-    e = expansion
-    prior_precision = np.zeros(len(e["u_hat"]))
-    for idx, h in zip(e["effects"], log_scales, strict=True):
-        prior_precision[idx] = np.exp(-2 * h)
-    u = e["u_hat"] + np.linalg.solve(e["A"] + np.diag(prior_precision), e["b"] - prior_precision * e["u_hat"])
-    return u, prior_precision
-
-
-def _neg_log_marginal(log_scales, expansion, density):
-    """Minus the Laplace-approximated log marginal posterior of the log-scales, from one expansion (up to a constant)."""
-    e = expansion
-    u, prior_precision = _expansion_optimum(log_scales, e)
-    try:
-        chol = np.linalg.cholesky(e["A"] + np.diag(prior_precision))
-    except np.linalg.LinAlgError:
-        return np.inf
-    delta = u - e["u_hat"]
-    value = e["b"] @ delta - 0.5 * delta @ e["A"] @ delta - 0.5 * (prior_precision * u * u).sum()
-    value -= np.dot([len(idx) for idx in e["effects"]], log_scales)  # normalizers of N(u; 0, scale^2)
-    # The scales' own prior and Jacobian, read off the density with every effect at 0, where the likelihood ignores them.
-    point = e["no_effects"].copy()
-    point[e["hyper"]] = log_scales
-    return -(value - np.log(np.diag(chol)).sum() + density.logp(point))
-
-
-def _empirical_bayes_scales(density, start_scales, rounds=5, tol=0.01, bounds=(1e-3, 10.0)):
-    """Slide scales at the mode of their marginal posterior, the slide effects integrated out by a Laplace approximation.
-
-    Each round finds the mode of everything else at the current scales and
-    the precision there, rewrites that expansion in terms of the slide
-    effects themselves (``u = scale * z``), where the scales enter only
-    through the Gaussian prior of ``u``, and maximizes the resulting marginal
-    over the log-scales (priors and Jacobians included); every evaluation is
-    one Cholesky factorization. The next round re-expands at the new scales.
-    For a Normal likelihood the expansion is exact up to sigma, so it settles
-    in two or three rounds. Returns ``(level_sd, curve_sd)``.
-    """
-    blocks = _blocks(density)
-    hyper = np.concatenate([blocks[name] for name in _SLIDE_SCALES])
-    free = np.setdiff1d(np.arange(len(density.start.data)), hyper)
-    position = np.full(len(density.start.data), -1)
-    position[free] = np.arange(len(free))
-    effects = [position[blocks[z]] for z in _SLIDE_SCALES.values()]  # per scale, its effects among the free coordinates
-    is_effect = np.zeros(len(free), dtype=bool)
-    for idx in effects:
-        is_effect[idx] = True
-
-    def to_z(log_scales):
-        """Per free coordinate the factor taking u to z (1/scale on the slide effects, 1 elsewhere)."""
-        out = np.ones(len(free))
-        for idx, h in zip(effects, log_scales, strict=True):
-            out[idx] = np.exp(-h)
-        return out
-
-    x = np.array(density.start.data, dtype=float)
-    x[hyper] = np.log(start_scales)
-    for _ in range(rounds):
-        x, precision = _mode(density, x, free)
-        log_scales = x[hyper].copy()
-        # The expansion in u = scale * z without z's N(0, 1) prior: b'(u - u_hat) - (u - u_hat)'A(u - u_hat)/2.
-        t = to_z(log_scales)
-        no_effects = x.copy()
-        no_effects[free[is_effect]] = 0.0
-        expansion = {
-            "b": t * (density.dlogp(x)[free] + np.where(is_effect, x[free], 0.0)),
-            "A": t[:, None] * (precision - np.diag(is_effect.astype(float))) * t[None, :],
-            "u_hat": x[free] / t,
-            "effects": effects,
-            "hyper": hyper,
-            "no_effects": no_effects,
-        }
-        result = optimize.minimize(
-            _neg_log_marginal,
-            log_scales,
-            args=(expansion, density),
-            method="L-BFGS-B",
-            bounds=[tuple(np.log(bounds))] * len(hyper),
-        )
-        u, _ = _expansion_optimum(result.x, expansion)
-        x[free] = u * to_z(result.x)
-        x[hyper] = result.x
-        if np.max(np.abs(result.x - log_scales)) < tol:
-            break
-    return tuple(float(v) for v in np.exp(x[hyper]))
-
-
-def _fit_advi_slides(model, settings, rebuild, guess):
-    """Full-rank ADVI for a model with slides, the two slide scales handled as ``settings["slide_scales"]`` says.
-
-    `rebuild(scales)` builds the same model with the scales fixed, `guess` is
-    `_guess_slide_scales`. Called outside any model context, as it builds a
-    second model for empirical Bayes. Returns ``(model the draws belong to, idata,
-    columns)``; the columns include the scales (estimates or posterior means).
-    """
-    density = _FlatDensity(model)
-    if settings["slide_scales"] == "empirical_bayes":
-        scales = _empirical_bayes_scales(density, guess)
-        fixed = rebuild(scales)
-        with fixed:
-            idata, columns = _fit_advi(fixed, settings, None)
-        return fixed, idata, {**columns, "sample_level_sd": scales[0], "sample_curve_sd": scales[1]}
-
-    blocks = _blocks(density)
-    hyper = np.concatenate([blocks[name] for name in _SLIDE_SCALES])
-    free = np.setdiff1d(np.arange(len(density.start.data)), hyper)
-    start = np.array(density.start.data, dtype=float)
-    start[hyper] = np.log(guess)
-    x, precision = _mode(density, start, free)
-    cov = np.zeros((len(x), len(x)))
-    cov[np.ix_(free, free)] = _inverse_psd(precision)
-    cov[hyper, hyper] = _DATA_START_LOG_SCALE_SD**2
-    with model:
-        idata, columns = _fit_advi(model, settings, None, start=(x, cov))
-    posterior = idata.posterior
-    return (
-        model,
-        idata,
-        {
-            **columns,
-            "sample_level_sd": float(posterior["sample_level_sd"].mean()),
-            "sample_curve_sd": float(posterior["sample_curve_sd"].mean()),
-        },
-    )
-
+# `_INFERENCE` maps a sampler name to a function that runs inside ``with model`` and returns the posterior as
+# `InferenceData` plus a dict of diagnostic columns. NUTS is only needed for non-normal coefficient priors.
 
 def _sample_nuts(model, sample_kwargs, diag_vars):
     """Sample the posterior with NUTS. `diag_vars` are the parameters the convergence diagnostics are reported for."""
@@ -872,51 +484,8 @@ def _sample_nuts(model, sample_kwargs, diag_vars):
     return idata, columns
 
 
-def _fit_advi(model, settings, diag_vars, start=None):
-    """Fit the posterior with full-rank ADVI started at its Laplace approximation (see `_VI_DEFAULTS`).
-
-    `start` ``(mean, covariance)`` on the flat unconstrained scale replaces the Laplace start.
-    """
-    density = _FlatDensity(model)
-    seed, n = settings["random_seed"], settings["n"]
-    inference = pm.FullRankADVI(model=model, random_seed=seed)
-    group = inference.approx.groups[0]
-    if density.names != list(group.ordering):
-        raise RuntimeError(f"ADVI orders its parameters {list(group.ordering)}, not {density.names}.")
-    if start is None and settings["init"] == "laplace":
-        start = _laplace(density)
-    if start is not None:
-        mode, cov = start
-        group.shared_params["mu"].set_value(mode)
-        group.shared_params["L_tril"].set_value(_tril_params(cov))
-
-    first, last = settings["learning_rate"], settings["final_learning_rate"]
-    learning_rate = pytensor.shared(np.float64(first), "learning_rate")
-
-    def anneal(approx, loss, step):
-        learning_rate.set_value(np.float64(first * (last / first) ** (step / n)))
-
-    approx = inference.fit(
-        n=n,
-        progressbar=False,
-        obj_n_mc=settings["obj_n_mc"],
-        obj_optimizer=pm.adam(learning_rate=learning_rate),
-        callbacks=[anneal],
-    )
-    idata = approx.sample(settings["draws"], random_seed=seed)
-
-    k, ess = np.nan, np.nan
-    if settings["diagnostic_draws"] > 0:
-        k, ess = _importance_diagnostics(
-            density, approx.mean.eval(), approx.cov.eval(), settings["diagnostic_draws"], seed
-        )
-    return idata, {"vi_khat": k, "vi_ess": ess}
-
-
-#: ``{name: function}`` - how `fit_model` can obtain the posterior of a gene; see `fit_model`'s `inference`.
 _INFERENCE = {
     "nuts": _sample_nuts,
-    "advi": _fit_advi,
 }
 
 
@@ -968,7 +537,7 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
             shared.priors,
             weights=shared.weights,
             ss_within=ss_within,
-            record_mu=shared.inference == "nuts",
+            record_mu=False,
             sample_index=shared.sample_index,
             n_samples=shared.n_samples,
             sample_scales=sample_scales,
@@ -978,21 +547,15 @@ def _fit_and_predict_gene(gene, Y, intercept_initval, shared, sample_kwargs, ss_
     slides = shared.sample_index is not None
 
     with _quiet_pymc():
-        if slides and shared.inference == "advi":  # builds its own models, so outside any model context
-            guess = _guess_slide_scales(
-                Y, shared.B, shared.condition_fit, shared.sample_index, shared.n_samples, shared.weights
-            )
-            model, idata, fit_columns = _fit_advi_slides(model, sample_kwargs, build, guess)
-        else:
-            with model:
-                diag_vars = ["intercept", "beta", "beta_1", "categorical_beta", "sigma"]
-                idata, fit_columns = _INFERENCE[shared.inference](model, sample_kwargs, diag_vars)
-                if slides:
-                    fit_columns = {
-                        **fit_columns,
-                        "sample_level_sd": float(idata.posterior["sample_level_sd"].mean()),
-                        "sample_curve_sd": float(idata.posterior["sample_curve_sd"].mean()),
-                    }
+        with model:
+            diag_vars = ["intercept", "beta", "beta_1", "categorical_beta", "sigma"]
+            idata, fit_columns = _INFERENCE[shared.inference](model, sample_kwargs, diag_vars)
+            if slides:
+                fit_columns = {
+                    **fit_columns,
+                    "sample_level_sd": float(idata.posterior["sample_level_sd"].mean()),
+                    "sample_curve_sd": float(idata.posterior["sample_curve_sd"].mean()),
+                }
     return _summarise_gene(gene, idata, shared, fit_columns)
 
 
@@ -1153,7 +716,8 @@ def _exact_profile_results(shared, Y, genes, ss_within, settings):
         curves = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i])) @ A.T
         ci_low, ci_high = np.quantile(curves, [0.03, 0.97], axis=0)
         diag_row = {"gene": gene, "sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
-        curve_row = {"mean": A @ post.mean[i], "ci_low": ci_low, "ci_high": ci_high, "beta": post.mean[i][1:]}
+        curve_row = {"mean": A @ post.mean[i], "ci_low": ci_low, "ci_high": ci_high, "beta": post.mean[i][1:],
+                     "beta_cov": post.cov[i][1:, 1:]}  # fmt: skip
         results.append((gene, diag_row, curve_row))
     return results
 
@@ -1180,7 +744,8 @@ def _fit_and_predict_profile(gene, Y, intercept_initval, shared, sample_kwargs, 
     beta_mean = idata.posterior["beta"].mean(("chain", "draw")).to_numpy()
 
     diag_row = {"gene": gene, **diag_columns}
-    curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high, "beta": beta_mean}
+    beta_cov = np.cov(_posterior_draws(idata, "beta"), rowvar=False)
+    curve_row = {"mean": mean, "ci_low": ci_low, "ci_high": ci_high, "beta": beta_mean, "beta_cov": beta_cov}
     return gene, diag_row, curve_row
 
 
@@ -1327,7 +892,7 @@ def _resolve_inference(inference, model_setup):
     )
     if inference == "exact" and not ok:
         raise ValueError(
-            "inference='exact' needs the normal likelihood and normal priors on the coefficients; use 'nuts' or 'advi'."
+            "inference='exact' needs the normal likelihood and normal priors on the coefficients; use 'nuts'."
         )
     resolved = ("exact" if ok else "nuts") if inference == "auto" else inference
     if resolved != "exact":
@@ -1471,8 +1036,8 @@ def fit_model(
         Extra keyword arguments merged into the `pymc.sample` call (applied
         to every gene). Any extra keyword arguments to `fit_model` itself are
         forwarded the same way, so ``fit_model(..., chains=2)`` also works.
-        With ``inference="advi"`` they are the settings of the variational
-        fit instead (see `inference`).
+        With ``inference="exact"`` only ``draws``, ``random_seed``,
+        ``n_grid`` and ``n_hyper`` apply.
     test
         Which test to run between the two condition curves:
 
@@ -1500,7 +1065,7 @@ def fit_model(
         uses an F reference with ``n_slides - 2`` denominator degrees of
         freedom (column ``parallel_df_denominator``). The fitted curves are
         the population-level ones. Fit on bins (NUTS is fine) or on cells
-        (``use_binned=False``, e.g. with ``inference="advi"``).
+        (``use_binned=False``).
 
         Both tests also write ``integral`` (the area between the curves),
         the ``categorical_beta`` summary and the sampler diagnostics.
@@ -1523,32 +1088,16 @@ def fit_model(
     inference
         How each gene's posterior is obtained:
 
-        - ``"nuts"`` (default): MCMC with `pymc.sample`, configured by
+        - ``"nuts"``: MCMC with `pymc.sample` (needs the ``pymc`` extra), configured by
           `sample_kwargs`. Reports ``n_divergent``, ``rhat_max`` and
           ``ess_bulk_min``.
-        - ``"advi"``: full-rank variational inference, started at the
-          Laplace approximation and polished with Adam (settings: ``n``,
-          ``learning_rate``, ``final_learning_rate``, ``draws``, ... see
-          ``_VI_DEFAULTS``; they go in `sample_kwargs`). Much cheaper than
-          NUTS where there are many rows, i.e. with ``use_binned=False``.
-          Reports ``vi_khat`` and ``vi_ess`` instead of the MCMC columns:
-          importance-sampling diagnostics of the approximation against the
-          true posterior (``vi_khat`` below ~0.7 and ``vi_ess`` above ~0.5
-          mean the covariance, which the ``"parallel"`` test is built on,
-          can be trusted; check them before reading the p-values). Mean-field
-          ADVI is deliberately not offered: it ignores the correlations of
-          the spline coefficients and so gets that covariance badly wrong.
-          ``n=0`` returns the Laplace approximation itself.
-          With slides (`diffsvg.pp.bin_obs` with `sample`) the setting
-          ``slide_scales`` decides how the two slide scales are handled:
-          ``"empirical_bayes"`` (default; fixed at the mode of their marginal
-          posterior, matches NUTS on simulated slides) or ``"data_start"``
-          (random, started at a least-squares guess; drifts to too small
-          scales and anti-conservative p-values on simulated slides, kept
-          for comparison). The polish then uses smaller steps
-          (``_VI_SLIDE_DEFAULTS``), the stats gain ``sample_level_sd`` and
-          ``sample_curve_sd``, and ``vi_ess`` above ~0.1 suffices: it falls
-          with the number of parameters even for a good approximation.
+        - ``"exact"``: the exact posterior (see `diffsvg.tl._exact`): the
+          coefficients are conjugate given the noise scale, which is
+          integrated out numerically, as are the two slide scales. No Monte
+          Carlo error and no sampler; needs the normal likelihood and normal
+          coefficient priors. Reports ``exact_edge_mass``.
+        - ``"auto"`` (default): ``"exact"`` where the model allows it,
+          ``"nuts"`` otherwise.
     coefs_key
         Prefix for two `adata.varm` tables (`n_genes x n_bsplines`) with the
         posterior means of the spline coefficients, consumed by
@@ -1579,16 +1128,9 @@ def fit_model(
             "init": "adapt_diag",
             "progressbar": False,
         }
-    else:
-        sample_defaults = dict(_VI_DEFAULTS)
-        if model_setup is not None and model_setup.binned.sample is not None:
-            sample_defaults.update(_VI_SLIDE_DEFAULTS)
     if inference != "exact":
         sample_defaults.update(sample_kwargs or {})
         sample_defaults.update(pymc_kwargs)
-    if inference == "advi":
-        _check_vi_settings(sample_defaults)
-
     binned = model_setup.binned
     if not binned.has_condition:
         raise ValueError(
@@ -1668,18 +1210,6 @@ def fit_model(
     stats_df = pd.DataFrame(stats_rows).set_index("gene").reindex(binned.genes)
     _TESTS[test][1](stats_df, null_quantile)
     test_params = {"test": test, "tau": float(tau)} if test == "parallel" else {"test": test}
-    if inference == "advi" and sample_defaults["diagnostic_draws"] > 0:
-        min_ess = _VI_MIN_ESS[binned.sample is not None]
-        failing = ~((stats_df["vi_khat"] < 0.7) & (stats_df["vi_ess"] > min_ess))
-        if failing.any():
-            warnings.warn(
-                f"{int(failing.sum())} of {len(failing)} genes fail the variational diagnostics (expected: vi_khat < 0.7 "
-                f"and vi_ess > {min_ess}), so the approximation does not match the posterior for them: do not read their "
-                "p-values."
-                + (" With slides, try the other `slide_scales` setting or NUTS on bins." if binned.sample else ""),
-                UserWarning,
-                stacklevel=2,
-            )
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer
@@ -1869,6 +1399,12 @@ def fit_profiles(
     for suffix, df in profile_dfs.items():
         adata.varm[f"{profiles_key}_{suffix}"] = df.reindex(adata.var_names)
     adata.varm[f"{profiles_key}_diagnostics"] = diagnostics_df.reindex(adata.var_names)
+    fitted = [g for g in binned.genes if g in curve_rows]
+    adata.uns[f"{profiles_key}_beta_cov"] = {
+        "genes": np.asarray(fitted, dtype=str),
+        "cov": np.stack([curve_rows[g]["beta_cov"] for g in fitted]),
+        "degree": int(binned.degree),
+    }
     return None
 
 
@@ -1899,19 +1435,21 @@ def one_vs_rest(
     null_quantile=0.9,
     inplace=False,
     key_added=None,
+    tau=0.1,
 ):
     """Compare one gene's expression profile against every other gene's.
 
     Each gene is reduced to a single curve along `anchor` (see
     `_gene_profiles`), and the probe gene is then tested against each of the
-    remaining genes individually. The per-comparison statistics mirror
-    `fit_model`'s: `T` is the functional L2 distance between the two curves
-    and drives the same empirical/Gamma null p-values, computed here over
-    the population of "rest" genes rather than over conditions.
+    remaining genes individually.
 
-    No Wald test is reported: it tests the interaction coefficient, which
-    the condition-free model does not have, and which is not what is being
-    compared here anyway.
+    With a `fit_profiles` result (which stores each gene's posterior
+    covariance of its spline coefficients) every pair gets the parallel-curves
+    test of `parallel_curves_test`: do the two genes' curves differ in shape,
+    beyond `tau`, rather than only in level? The covariance of the difference
+    is the sum of the two genes' posterior covariances (their fits are
+    independent). Without it (curves averaged from `fit_model`), the pairs
+    are ranked by ``T`` against a Gamma null fitted to the "rest" genes.
 
     Parameters
     ----------
@@ -1923,9 +1461,10 @@ def one_vs_rest(
         `adata.varm` prefixes written by `fit_model` / `fit_profiles`. An
         explicit `fit_profiles` result wins when both are present.
     null_quantile
-        Fraction of the "rest" genes assumed to follow the null: the Gamma
-        null is fitted to the lower `null_quantile` of their ``T`` values, as a
-        truncated sample (see `_gamma_null_pvalues`).
+        Only without a `fit_profiles` result: fraction of the "rest" genes
+        assumed to follow the null; the Gamma null is fitted to the lower
+        `null_quantile` of their ``T`` values, as a truncated sample (see
+        `_gamma_null_pvalues`).
     inplace
         If `True`, also write the table to ``adata.varm[key_added]``
         (reindexed to ``adata.var_names``, so the probe gene's own row is
@@ -1933,16 +1472,18 @@ def one_vs_rest(
     key_added
         `adata.varm` key used when `inplace`; defaults to
         ``f"dsvg_ovr_{gene}"``.
+    tau
+        Smallest shape difference between two genes' curves that counts, as in
+        `parallel_curves_test`.
 
     Returns
     -------
     pandas.DataFrame
         Indexed by the "rest" genes, with ``delta`` (the signed area between
         the probe curve and that gene's, negative when the probe sits below
-        it), ``T``, and the Gamma-null p-value ``gamma_pval`` with its
-        BH-adjusted ``gamma_pval_adj``. (The empirical p-value that used to be
-        here was circular: it always gave the top `1 - null_quantile` of the
-        genes the smallest possible p-value.)
+        it) and ``T``; with a `fit_profiles` result ``shape_diff``,
+        ``parallel_stat``, ``parallel_pval`` and ``parallel_pval_adj``,
+        otherwise the Gamma-null ``gamma_pval`` and ``gamma_pval_adj``.
     """
     profiles, source = _gene_profiles(adata, curves_key, profiles_key)
     if gene not in profiles.index:
@@ -1966,8 +1507,24 @@ def one_vs_rest(
         },
         index=rest.index,
     )
-    result["gamma_pval"] = _gamma_null_pvalues(result["T"].to_numpy(), null_quantile=null_quantile)
-    result["gamma_pval_adj"] = _benjamini_hochberg(result["gamma_pval"].to_numpy())
+    cov_key = f"{profiles_key}_beta_cov"
+    if source == "profiles" and cov_key in adata.uns:
+        stored = adata.uns[cov_key]
+        position = {str(g): i for i, g in enumerate(stored["genes"])}
+        covs = np.asarray(stored["cov"])
+        betas = adata.varm[f"{profiles_key}_beta"]
+        metric = shape_metric(covs.shape[1], int(stored["degree"]))
+        rows = []
+        for other in rest.index:
+            d_beta = betas.loc[gene].to_numpy(dtype=float) - betas.loc[other].to_numpy(dtype=float)
+            cov = covs[position[gene]] + covs[position[other]]
+            rows.append(parallel_curves_test(d_beta, metric, tau=tau, cov=cov))
+        shape_diff, stat, _, pval = (np.asarray(v) for v in zip(*rows, strict=True))
+        result["shape_diff"], result["parallel_stat"], result["parallel_pval"] = shape_diff, stat, pval
+        result["parallel_pval_adj"] = _benjamini_hochberg(pval)
+    else:
+        result["gamma_pval"] = _gamma_null_pvalues(result["T"].to_numpy(), null_quantile=null_quantile)
+        result["gamma_pval_adj"] = _benjamini_hochberg(result["gamma_pval"].to_numpy())
     result.attrs["probe_gene"] = gene
     result.attrs["profile_source"] = source
 
