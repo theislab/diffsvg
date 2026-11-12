@@ -38,7 +38,9 @@ def _stability_defaults():
 def _format_value(value):
     """Compact, readable rendering of a parameter value for run labels."""
     if isinstance(value, dict):  # a priors override
-        return "+".join(f"{name}:{spec[0]}" for name, spec in sorted(value.items()))
+        # The full spec, not just the distribution name: two overrides of the same prior with different
+        # parameters must get different run labels.
+        return "+".join(f"{name}:{spec[0]}({','.join(str(v) for v in spec[1:])})" for name, spec in sorted(value.items()))
     return str(value)
 
 
@@ -107,7 +109,7 @@ def check_stability(
     grid,
     baseline=None,
     genes=50,
-    rank_by="wald_stat",
+    rank_by=None,
     higher_is_stronger=True,
     top_k=10,
     n_seeds=2,
@@ -116,8 +118,9 @@ def check_stability(
     random_state=0,
     design_matrix="design_matrix",
     sample_kwargs=None,
-    test="wald",
+    test="parallel",
     tau=0.1,
+    sample=None,
 ):
     """Re-rank genes under every combination in `grid` and measure how much the ranking moves.
 
@@ -150,8 +153,9 @@ def check_stability(
         Column of `fit_model`'s statistics table to rank on, and whether
         larger means stronger. Rank on a statistic rather than a p-value:
         the Wald test's p-values are computed against the panel, so
-        subsampling shifts them and they do not compare across runs. With
-        ``test="parallel"``, rank on e.g. ``"parallel_stat"``.
+        subsampling shifts them and they do not compare across runs. Defaults
+        to ``"parallel_stat"`` for ``test="parallel"`` and ``"wald_stat"`` for
+        ``test="wald"``.
     top_k
         Size of the "top genes" set used for the overlap metric.
     n_seeds
@@ -166,6 +170,11 @@ def check_stability(
         Seed for the gene subsample.
     test, tau
         Which condition test every run uses, as in `fit_model`.
+    sample
+        Passed to `diffsvg.pp.bin_obs`: the slide column for data with several
+        slides per condition, so every run uses the model with slide effects
+        (needs ``window_radius=None`` and ``test="parallel"``). Without it,
+        multi-slide data is pooled and the rankings are over-confident.
 
     Returns
     -------
@@ -179,6 +188,8 @@ def check_stability(
     if not grid:
         raise ValueError("`grid` is empty - pass at least one parameter to vary.")
 
+    if rank_by is None:
+        rank_by = "parallel_stat" if test == "parallel" else "wald_stat"
     defaults = _stability_defaults()
     gene_list = _resolve_genes(adata, genes, random_state)
     sample_kwargs = dict(sample_kwargs or {})
@@ -198,7 +209,9 @@ def check_stability(
         if baseline_config not in configs:
             configs.insert(0, baseline_config)
 
-    varying = [a for a in axes if len(grid[a]) > 1]
+    # Label runs by every parameter that differs between them, including a `baseline` value that is not on
+    # the grid, so that no two runs share a label (they would overwrite each other's column).
+    varying = [a for a in defaults if len({_format_value(c[a]) for c in configs}) > 1]
 
     def label_for(config):
         if not varying:
@@ -208,6 +221,9 @@ def check_stability(
     baseline_label = label_for(baseline_config)
     runs = [(label_for(config), config, base_seed) for config in configs]
     runs += [(f"{baseline_label} (reseed {i})", baseline_config, base_seed + i) for i in range(1, max(1, int(n_seeds)))]
+    labels = [label for label, _, _ in runs]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"Two runs got the same label, which would merge their results: {labels}")
 
     # Group by binning signature so each distinct binning is computed once.
     grouped = {}
@@ -225,6 +241,7 @@ def check_stability(
             genes=gene_list,
             design_matrix=design_matrix,
             inplace=False,
+            sample=sample,
             **{p: bin_config[p] for p in _BIN_PARAMS},
         )
         for label, config, seed in group:
