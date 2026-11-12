@@ -163,3 +163,25 @@ def test_cells_without_a_sample_are_left_out_of_the_binning():
     )
     assert b.n_samples == 9 and "s3" not in b.sample_labels
     assert b.n_obs.sum() == adata.n_obs - 200
+
+
+def test_two_stage_slope_test_on_slides():
+    """Slides with random slopes and no condition effect stay null; a real slope difference is found."""
+    rng = np.random.default_rng(1)
+    rows = []
+    for s in range(12):
+        cond = "a" if s < 6 else "b"
+        x = rng.random(400)
+        slope = rng.normal(1.0, 0.3) + (0.8 if cond == "b" else 0.0)
+        null = rng.normal(0, 0.3) + rng.normal(1.0, 0.3) * x  # random slide slope, no condition effect
+        eff = slope * x
+        for xi, n_i, e_i in zip(x, null, eff, strict=True):
+            rows.append((xi, cond, f"s{s}", n_i + rng.normal(0, 0.2), e_i + rng.normal(0, 0.2)))
+    df = pd.DataFrame(rows, columns=["anchor", "condition", "slide", "null", "effect"])
+    adata = ad.AnnData(df[["null", "effect"]].to_numpy(np.float32), var=pd.DataFrame(index=["null", "effect"]))
+    adata.obsm["design_matrix"] = df[["anchor", "condition", "slide"]].set_index(adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
+    stats, _, _ = dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="slope", inplace=False, progressbar=False)
+    assert stats.loc["effect", "slope_pval"] < 0.01 and stats.loc["null", "slope_pval"] > 0.01
+    assert abs(stats.loc["effect", "slope_diff"] - 0.8) < 0.3
+    assert stats.loc["effect", "slope_df_denominator"] == 10
