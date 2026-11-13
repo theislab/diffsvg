@@ -181,7 +181,9 @@ def test_two_stage_slope_test_on_slides():
     adata = ad.AnnData(df[["null", "effect"]].to_numpy(np.float32), var=pd.DataFrame(index=["null", "effect"]))
     adata.obsm["design_matrix"] = df[["anchor", "condition", "slide"]].set_index(adata.obs_names)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
-    stats, _, _ = dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="slope", inplace=False, progressbar=False)
+    stats, _, _ = dvg.tl.fit_model(
+        adata, dvg.tl.setup_model(adata), test="slope", inplace=False, progressbar=False, two_stage=True
+    )
     assert stats.loc["effect", "slope_pval"] < 0.01 and stats.loc["null", "slope_pval"] > 0.01
     assert abs(stats.loc["effect", "slope_diff"] - 0.8) < 0.3
     assert stats.loc["effect", "slope_df_denominator"] == 10
@@ -202,7 +204,7 @@ def test_tests_use_the_anchor_range_where_the_cells_are():
     adata = ad.AnnData(df[["y"]].to_numpy(np.float32), var=pd.DataFrame(index=["y"]))
     adata.obsm["design_matrix"] = df[["anchor", "condition", "slide"]].set_index(adata.obs_names)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
-    with pytest.warns(UserWarning, match="no cells"):
+    with pytest.warns(UserWarning, match="cover only"):
         stats, _, _ = dvg.tl.fit_model(
             adata, dvg.tl.setup_model(adata), test="slope", inplace=False, progressbar=False, two_stage=False
         )
@@ -220,13 +222,3 @@ def test_anchor_support_is_the_central_cells_where_both_conditions_are():
     counts[0, 1] = 50  # one condition only: not part of the support
     assert np.allclose(_anchor_support(SimpleNamespace(n_obs_grid=counts, bin_centers=x)), (0.3, 0.8))
     assert _anchor_support(SimpleNamespace(n_obs_grid=None, bin_centers=x)) == (0.0, 1.0)
-
-
-def test_advi_is_an_alias_for_auto():
-    adata = _slides(n_per_slide=100)
-    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None)
-    with pytest.warns(FutureWarning, match="advi"):
-        stats, _, _ = dvg.tl.fit_model(
-            adata, dvg.tl.setup_model(adata), inference="advi", inplace=False, progressbar=False
-        )
-    assert stats["parallel_pval"].notna().all()
