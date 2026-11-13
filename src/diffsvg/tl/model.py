@@ -1187,7 +1187,7 @@ def fit_model(
     predictive_seed=None,
     inference="auto",
     coefs_key="dsvg_coefs",
-    two_stage=True,
+    two_stage=False,
     **pymc_kwargs,
 ):
     """Fit every per-gene model from `setup_model`, in parallel, and summarize the result.
@@ -1331,8 +1331,11 @@ def fit_model(
         denominator degrees of freedom). Every slide counts once and nothing
         is assumed about how slides differ, so the error rate holds when the
         joint model's random curve is misspecified. The fitted curves and
-        bands still come from the joint model. ``False`` uses the joint
-        model's posterior for the test as well.
+        bands still come from the joint model. ``False`` (default) uses the
+        joint model's posterior for the test as well, which has more power
+        with few slides. Use ``True`` when the cells cover only part of the
+        anchor range (e.g. a cell type confined to some cortical layers);
+        `fit_model` warns then.
     predictive_seed
         Deprecated, has no effect. The curves, their bands, ``integral`` and
         the Wald test are now computed from the posterior draws of the mean
@@ -1412,6 +1415,14 @@ def fit_model(
         _warn_unsupported_range(binned)
     fit_genes = _fittable_genes(binned.genes, Y)
     support = _anchor_support(binned) if use_binned else (0.0, 1.0)
+    if n_samples is not None and not two_stage and support[1] - support[0] < 0.75:
+        warnings.warn(
+            f"The cells cover only {support[0]:.2f} to {support[1]:.2f} of the anchor range. With slides, the "
+            "joint model's test can be overconfident there (random slide splits of cell types confined to part of "
+            "the range gave false hits); `two_stage=True` stays calibrated.",
+            UserWarning,
+            stacklevel=2,
+        )
     shared = _FitShared(
         B=B,
         B_masked=B_masked,
