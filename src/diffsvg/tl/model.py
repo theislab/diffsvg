@@ -40,6 +40,7 @@ def _require_pymc(inference):
             "The default inference='auto' uses the exact posterior wherever the model allows it."
         )
 
+
 # ============================================================
 # 1) Priors and likelihoods
 # ============================================================
@@ -320,6 +321,8 @@ class _FitShared:
     sample_index: np.ndarray | None = None
     n_samples: int | None = None
     df_denominator: int | None = None
+    # The anchor range the tests are computed over, see `_anchor_support`.
+    support: tuple = (0.0, 1.0)
 
 
 @dataclass
@@ -470,6 +473,7 @@ def _quiet_pymc():
 # ------------------------------------------------------------
 # `_INFERENCE` maps a sampler name to a function that runs inside ``with model`` and returns the posterior as
 # `InferenceData` plus a dict of diagnostic columns. NUTS is only needed for non-normal coefficient priors.
+
 
 def _sample_nuts(model, sample_kwargs, diag_vars):
     """Sample the posterior with NUTS. `diag_vars` are the parameters the convergence diagnostics are reported for."""
@@ -676,7 +680,12 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
     results = []
     for i, gene in enumerate(genes):
         theta = res["draws"][i]
-        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        draws = {
+            "intercept": theta[:, 0],
+            "beta": theta[:, 1 : K + 1],
+            "categorical_beta": theta[:, K + 1],
+            "beta_1": theta[:, K + 2 :],
+        }
         fit_columns = {
             "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
             "sample_level_sd": float(res["level_sd_mean"][i]),
@@ -693,13 +702,20 @@ def _exact_gene_results(shared, Y, genes, ss_within, settings):
         return _exact_slide_results(shared, Y, genes, ss_within, settings)
     design = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
     names = ("intercept", "beta", "categorical_beta", "beta_1")
-    post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings)
+    post = _exact_fit(
+        design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors), names, shared.n_bsplines, settings
+    )
     K = shared.n_bsplines
     seeds = np.random.SeedSequence(settings["random_seed"]).spawn(len(genes))
     results = []
     for i, gene in enumerate(genes):
         theta = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i]))
-        draws = {"intercept": theta[:, 0], "beta": theta[:, 1 : K + 1], "categorical_beta": theta[:, K + 1], "beta_1": theta[:, K + 2 :]}
+        draws = {
+            "intercept": theta[:, 0],
+            "beta": theta[:, 1 : K + 1],
+            "categorical_beta": theta[:, K + 1],
+            "beta_1": theta[:, K + 2 :],
+        }
         fit_columns = {"sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
         results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(post.mean[i], post.cov[i])))
     return results
@@ -716,7 +732,11 @@ def _exact_profile_results(shared, Y, genes, ss_within, settings):
     for i, gene in enumerate(genes):
         curves = _exact.draws(post, i, settings["draws"], np.random.default_rng(seeds[i])) @ A.T
         ci_low, ci_high = np.quantile(curves, [0.03, 0.97], axis=0)
-        diag_row = {"gene": gene, "sigma_mean": float(np.sqrt(post.sigma2_mean[i])), "exact_edge_mass": float(post.edge_mass[i])}
+        diag_row = {
+            "gene": gene,
+            "sigma_mean": float(np.sqrt(post.sigma2_mean[i])),
+            "exact_edge_mass": float(post.edge_mass[i]),
+        }
         curve_row = {"mean": A @ post.mean[i], "ci_low": ci_low, "ci_high": ci_high, "beta": post.mean[i][1:],
                      "beta_cov": post.cov[i][1:, 1:]}  # fmt: skip
         results.append((gene, diag_row, curve_row))
@@ -808,15 +828,17 @@ def _wald_gene_stats(draws0, draws1, idata, shared, moments=None):
     `draws0`/`draws1` are posterior draws of the mean curves, so the covariance is that of the
     coefficients behind ``d(x) = f1(x) - f0(x)`` (rank ``n_bsplines``: the level plus the shape directions).
     """
+    x = np.asarray(shared.bin_centers, dtype=float)
+    inside = (x >= shared.support[0] - 1e-9) & (x <= shared.support[1] + 1e-9)
     if moments is None:
         delta = draws1 - draws0
         delta_mean = delta.mean(axis=0)
-        cov = np.cov(delta, rowvar=False)
+        cov = np.cov(delta[:, inside], rowvar=False)
     else:
         A0, A1 = _condition_maps(shared)
         A = A1 - A0
-        delta_mean, cov = A @ moments[0], A @ moments[1] @ A.T
-    wald_stat, wald_pval, wald_df = _wald_from_moments(delta_mean, cov, df_denominator=shared.df_denominator)
+        delta_mean, cov = A @ moments[0], A[inside] @ moments[1] @ A[inside].T
+    wald_stat, wald_pval, wald_df = _wald_from_moments(delta_mean[inside], cov, df_denominator=shared.df_denominator)
     T = float(np.mean(delta_mean**2))
     row = {"wald_stat": wald_stat, "wald_pval": wald_pval, "wald_df": wald_df, "T": T}
     if shared.df_denominator is not None:
@@ -824,19 +846,47 @@ def _wald_gene_stats(draws0, draws1, idata, shared, moments=None):
     return row, delta_mean
 
 
-def _level_weights(bin_centers):
-    """Trapezoid weights that turn a curve on the grid into its mean over ``[0, 1]``."""
+def _anchor_support(binned, coverage=0.96):
+    """The anchor range the condition tests are computed over: where the cells are.
+
+    The central `coverage` of the cells (2nd to 98th percentile by default), cut to the grid points where both
+    conditions have cells. Outside it a curve is extrapolated from the spline and the prior, so a level, slope
+    or shape averaged over all of ``[0, 1]`` would be dominated by the prior there; with slides that makes the
+    test far too confident. Returns ``(lo, hi)``, or ``(0, 1)`` when the cell counts per grid point are unknown
+    (overlapping bins, fits on cells).
+    """
+    counts = getattr(binned, "n_obs_grid", None)
+    if counts is None:
+        return 0.0, 1.0
+    counts = np.asarray(counts, dtype=float)
+    x = np.asarray(binned.bin_centers, dtype=float)
+    both = (counts > 0).all(axis=0) if counts.shape[0] > 1 else counts[0] > 0
+    total = counts.sum(axis=0) * both
+    if total.sum() == 0:
+        return 0.0, 1.0
+    cdf = np.cumsum(total) / total.sum()
+    tail = (1 - coverage) / 2
+    lo, hi = x[np.searchsorted(cdf, tail)], x[min(np.searchsorted(cdf, 1 - tail), len(x) - 1)]
+    return (float(lo), float(hi)) if hi > lo else (0.0, 1.0)
+
+
+def _level_weights(bin_centers, support=(0.0, 1.0)):
+    """Trapezoid weights that turn a curve on the grid into its mean over `support`."""
     x = np.asarray(bin_centers, dtype=float)
+    inside = (x >= support[0] - 1e-9) & (x <= support[1] + 1e-9)
+    xi = x[inside]
     w = np.zeros(len(x))
-    dx = np.diff(x)
-    w[:-1] += dx / 2
-    w[1:] += dx / 2
-    return w / (x[-1] - x[0])
+    wi = np.zeros(len(xi))
+    dx = np.diff(xi)
+    wi[:-1] += dx / 2
+    wi[1:] += dx / 2
+    w[inside] = wi / (xi[-1] - xi[0])
+    return w
 
 
 def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
     """Test of the level difference ``mean_x (f1 - f0)``, ``H0: |level| <= tau``, plus its credible interval."""
-    a = _level_weights(shared.bin_centers)
+    a = _level_weights(shared.bin_centers, shared.support)
     level_draws = (draws1 - draws0) @ a
     if moments is None:
         delta_mean = (draws1 - draws0).mean(axis=0)
@@ -849,7 +899,13 @@ def _level_gene_stats(draws0, draws1, idata, shared, moments=None):
     stat = level**2 / var
     pval = _one_df_pval(stat, var, shared.tau, shared.df_denominator)
     low, high = (float(v) for v in np.quantile(level_draws, [0.03, 0.97]))
-    row = {"level_diff": level, "level_diff_ci_low": low, "level_diff_ci_high": high, "level_stat": stat, "level_pval": pval}
+    row = {
+        "level_diff": level,
+        "level_diff_ci_low": low,
+        "level_diff_ci_high": high,
+        "level_stat": stat,
+        "level_pval": pval,
+    }
     if shared.df_denominator is not None:
         row["level_df_denominator"] = shared.df_denominator
     return row, delta_mean
@@ -873,7 +929,9 @@ def _two_stage_stats(shared, Y, genes, test, tau, ridge=1e-3):
     for s in range(n_s):
         rows = np.asarray(shared.sample_index) == s
         Xs, ws = X[rows], w[rows]
-        coefs.append(np.linalg.solve(Xs.T @ (ws[:, None] * Xs) + ridge * np.eye(X.shape[1]), Xs.T @ (ws[:, None] * Ymat[rows])))
+        coefs.append(
+            np.linalg.solve(Xs.T @ (ws[:, None] * Xs) + ridge * np.eye(X.shape[1]), Xs.T @ (ws[:, None] * Ymat[rows]))
+        )
         cond[s] = np.asarray(shared.condition_fit)[rows][0]
     coefs = np.stack(coefs)  # (slides, 1 + K, genes)
     curves = np.einsum("pk,skg->spg", np.column_stack([np.ones(len(shared.B_pred)), shared.B_pred]), coefs)
@@ -882,7 +940,7 @@ def _two_stage_stats(shared, Y, genes, test, tau, ridge=1e-3):
     df = n1 + n0 - 2
     rows = {}
     if test in ("level", "slope"):
-        a = _level_weights(shared.bin_centers)
+        a = _level_weights(shared.bin_centers, shared.support)
         if test == "level":
             func = a
         else:
@@ -901,13 +959,20 @@ def _two_stage_stats(shared, Y, genes, test, tau, ridge=1e-3):
                 f"{test}_df_denominator": df,
             }  # fmt: skip
     elif test == "parallel":
+        x = np.asarray(shared.bin_centers, dtype=float)
+        inside = (x >= shared.support[0] - 1e-9) & (x <= shared.support[1] + 1e-9)
+        cols = np.abs(np.asarray(shared.B_pred)[inside]).max(axis=0) > 1e-8  # basis functions seen on the support
+        coefs = np.concatenate([coefs[:, :1], coefs[:, 1:][:, cols]], axis=1)
         K = coefs.shape[1] - 1
         if df - K + 1 < 1:
             raise ValueError(f"The two-stage shape test needs more than {K + 1} slides, found {n_s}; use test='slope'.")
         for i, g in enumerate(genes):
             b = coefs[:, 1:, i]
             d = b[g1].mean(0) - b[g0].mean(0)
-            S = ((b[g1] - b[g1].mean(0)).T @ (b[g1] - b[g1].mean(0)) + (b[g0] - b[g0].mean(0)).T @ (b[g0] - b[g0].mean(0))) / df
+            S = (
+                (b[g1] - b[g1].mean(0)).T @ (b[g1] - b[g1].mean(0))
+                + (b[g0] - b[g0].mean(0)).T @ (b[g0] - b[g0].mean(0))
+            ) / df
             T2 = float(d @ np.linalg.pinv(S) @ d) * n1 * n0 / (n1 + n0)
             F = T2 * (df - K + 1) / (df * K)
             rows[g] = {"parallel_stat": T2, "parallel_pval": float(f.sf(F, K, df - K + 1)), "parallel_df": K,
@@ -1032,6 +1097,14 @@ def _coef_columns(n_bsplines):
 
 def _resolve_inference(inference, model_setup):
     """``"auto"`` picks exact inference where the model allows it (see `_exact.supported`), NUTS otherwise."""
+    if inference == "advi":
+        warnings.warn(
+            "inference='advi' was removed: the exact posterior replaces it (same model, no approximation, much "
+            "faster). Running inference='auto' instead; pass that to silence this warning.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        inference = "auto"
     allowed = ("auto", "exact", *_INFERENCE)
     if inference not in allowed:
         raise ValueError(f"Unknown inference {inference!r}. Available: {sorted(allowed)}")
@@ -1061,9 +1134,12 @@ def _warn_predictive_seed(predictive_seed):
 
 
 def _fittable_genes(genes, Y):
-    """The genes worth fitting. Genes whose fitted rows are constant (e.g. all zero) are left out with a
-    warning: the model reproduces them exactly, so the noise scale has no lower bound and the posterior
-    is improper (the sampler diverges and the test would be meaningless). Their stats stay missing."""
+    """The genes worth fitting.
+
+    Genes whose fitted rows are constant (e.g. all zero) are left out with a warning: the model reproduces
+    them exactly, so the noise scale has no lower bound and the posterior is improper (the sampler diverges
+    and the test would be meaningless). Their stats stay missing.
+    """
     degenerate = [g for g in genes if not np.isfinite(Y[g]).all() or np.ptp(np.asarray(Y[g], dtype=float)) == 0]
     if degenerate:
         shown = ", ".join(degenerate[:10]) + (" ..." if len(degenerate) > 10 else "")
@@ -1232,6 +1308,14 @@ def fit_model(
         the population-level ones. Fit on bins (NUTS is fine) or on cells
         (``use_binned=False``).
 
+        Every test is computed over the anchor range where the cells are:
+        the central 96% of them, cut to where both conditions have cells
+        (``anchor_support`` in the stored test parameters). Outside it the
+        curves are extrapolated from the spline and the prior, and averaging
+        over that part would make the test overconfident, most of all for
+        cell types that occupy only part of the anchor range. Slopes and
+        shape differences stay in units of the full ``[0, 1]`` range.
+
         Both tests also write ``integral`` (the area between the curves),
         the ``categorical_beta`` summary and the sampler diagnostics.
         Binned fits with overlapping windows (`diffsvg.pp.bin_obs`'s default
@@ -1335,6 +1419,7 @@ def fit_model(
     if use_binned and binned.condition is not None and binned.n_obs_grid is not None:
         _warn_unsupported_range(binned)
     fit_genes = _fittable_genes(binned.genes, Y)
+    support = _anchor_support(binned) if use_binned else (0.0, 1.0)
     shared = _FitShared(
         B=B,
         B_masked=B_masked,
@@ -1350,8 +1435,11 @@ def fit_model(
         condition_pred_1=binned.condition_pred_1,
         test=test,
         tau=float(tau),
-        shape_metric=shape_metric(binned.n_bsplines, binned.degree) if test == "parallel" else None,
-        slope_weights=_slope_weights(binned.n_bsplines, binned.degree) if test in ("parallel", "slope") else None,
+        shape_metric=shape_metric(binned.n_bsplines, binned.degree, support=support) if test == "parallel" else None,
+        slope_weights=(
+            _slope_weights(binned.n_bsplines, binned.degree, support=support) if test in ("parallel", "slope") else None
+        ),
+        support=support,
         weights=weights,
         inference=inference,
         sample_index=sample_index,
@@ -1391,6 +1479,7 @@ def fit_model(
     _TESTS[test][1](stats_df, null_quantile)
     test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level", "slope") else {"test": test}
     test_params["two_stage"] = bool(two_stage and n_samples is not None)
+    test_params["anchor_support"] = [float(v) for v in support]
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer
@@ -1768,15 +1857,15 @@ def _wald_from_moments(mu, Sigma, ridge=0.0, df_denominator=None):
     return W, pval, df
 
 
-def _shape_grid(n_bsplines, degree, n_grid):
-    """Fine grid on ``[0, 1]``, its trapezoid weights (summing to 1) and the uncentred basis on it."""
-    x = np.linspace(0.0, 1.0, n_grid)
+def _shape_grid(n_bsplines, degree, n_grid, support=(0.0, 1.0)):
+    """Fine grid on `support`, its trapezoid weights (summing to 1) and the uncentred basis on it."""
+    x = np.linspace(support[0], support[1], n_grid)
     w = np.full(n_grid, 1.0 / (n_grid - 1))
     w[[0, -1]] /= 2
     return x, w, _bspline_basis_01(x, n_bsplines, degree)
 
 
-def shape_metric(n_bsplines=10, degree=3, n_grid=2001):
+def shape_metric(n_bsplines=10, degree=3, n_grid=2001, support=(0.0, 1.0)):
     """Quadratic form `Q` that measures how far two condition curves are from parallel.
 
     For interaction coefficients `b` (``beta_1`` of the per-gene model),
@@ -1796,6 +1885,9 @@ def shape_metric(n_bsplines=10, degree=3, n_grid=2001):
         As in `diffsvg.pp.bin_obs`.
     n_grid
         Grid points for the numerical integral.
+    support
+        The part of ``[0, 1]`` the shape is measured over (see `fit_model`).
+        Slopes stay in units of the full anchor range.
 
     Returns
     -------
@@ -1803,15 +1895,16 @@ def shape_metric(n_bsplines=10, degree=3, n_grid=2001):
         `Q`, shape ``(n_bsplines, n_bsplines)``, positive semi-definite with
         rank ``n_bsplines - 1``.
     """
-    _, w, B = _shape_grid(n_bsplines, degree, n_grid)
+    _, w, B = _shape_grid(n_bsplines, degree, n_grid, support)
     centred = B - w @ B
-    return 12.0 * (centred * w[:, None]).T @ centred
+    return 12.0 / (support[1] - support[0]) ** 2 * (centred * w[:, None]).T @ centred
 
 
-def _slope_weights(n_bsplines, degree, n_grid=2001):
-    """`g` with ``g @ b`` = the least-squares slope over ``[0, 1]`` of the difference curve for coefficients `b`."""
-    x, w, B = _shape_grid(n_bsplines, degree, n_grid)
-    return 12.0 * ((x - 0.5) * w) @ B
+def _slope_weights(n_bsplines, degree, n_grid=2001, support=(0.0, 1.0)):
+    """`g` with ``g @ b`` = the least-squares slope over `support` of the difference curve for coefficients `b`."""
+    x, w, B = _shape_grid(n_bsplines, degree, n_grid, support)
+    xc = x - w @ x
+    return ((xc * w) @ B) / (w @ xc**2)
 
 
 def parallel_curves_test(beta_1, metric, tau=0.1, cov=None, df_denominator=None):

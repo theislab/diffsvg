@@ -27,6 +27,7 @@ p.add_argument("--pooled", action="store_true")
 p.add_argument("--test", default="parallel", choices=["parallel", "level", "slope", "wald"])
 p.add_argument("--tau", type=float, default=0.0)
 p.add_argument("--cap", type=float, default=500.0)
+p.add_argument("--joint", action="store_true", help="joint-model test instead of the two-stage test")
 p.add_argument("--data", default=os.path.expanduser("~/Documents/data/diffsvg/liver_fibrosis_merfish.h5ad"))
 p.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
 args = p.parse_args()
@@ -63,9 +64,9 @@ a.obsm["design_matrix"] = pd.DataFrame(
 )
 t0 = time.perf_counter()
 dvg.pp.bin_obs(a, anchor="portal_dist", condition="condition", layer="lognorm", sample=None if args.pooled else "donor")
-stats, preds, curves = dvg.tl.fit_model(a, dvg.tl.setup_model(a), inplace=False, progressbar=False, test=args.test, tau=args.tau)
+stats, preds, curves = dvg.tl.fit_model(a, dvg.tl.setup_model(a), inplace=False, progressbar=False, test=args.test, tau=args.tau, two_stage=not args.joint)
 dt = time.perf_counter() - t0
-tag = f"{args.contrast}{'' if args.contrast == 'disease' else args.seed}_{'pooled' if args.pooled else 'donor'}_{args.test}_tau{args.tau:g}"
+tag = ("joint_" if args.joint else "") + f"{args.contrast}{'' if args.contrast == 'disease' else args.seed}_{'pooled' if args.pooled else 'donor'}_{args.test}_tau{args.tau:g}"
 os.makedirs(args.out, exist_ok=True)
 stats.to_csv(os.path.join(args.out, f"{tag}.csv"))
 for k in ("cond0_mean", "cond0_ci_low", "cond0_ci_high", "cond1_mean", "cond1_ci_low", "cond1_ci_high"):

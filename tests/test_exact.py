@@ -41,7 +41,9 @@ def test_exact_draws_have_the_exact_moments():
     rng = np.random.default_rng(1)
     X = np.column_stack([np.ones(100), rng.normal(size=(100, 2))])
     y = X @ np.array([0.0, 1.0, 0.5]) + rng.normal(size=100)
-    post = _exact.posterior(*_exact.sufficient_statistics(X, y[:, None]), 100, np.zeros(3), np.ones(3), ("halfnormal", 1.0))
+    post = _exact.posterior(
+        *_exact.sufficient_statistics(X, y[:, None]), 100, np.zeros(3), np.ones(3), ("halfnormal", 1.0)
+    )
     theta = _exact.draws(post, 0, 200000, np.random.default_rng(2))
     np.testing.assert_allclose(theta.mean(axis=0), post.mean[0], atol=0.01)
     np.testing.assert_allclose(np.cov(theta, rowvar=False), post.cov[0], atol=0.005)
@@ -52,7 +54,9 @@ def test_exact_fit_matches_nuts(use_binned):
     adata = _adata()
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20)
     setup = dvg.tl.setup_model(adata)
-    exact, _, _ = dvg.tl.fit_model(adata, setup, inference="exact", inplace=False, progressbar=False, use_binned=use_binned)
+    exact, _, _ = dvg.tl.fit_model(
+        adata, setup, inference="exact", inplace=False, progressbar=False, use_binned=use_binned
+    )
     nuts, _, _ = dvg.tl.fit_model(
         adata, setup, inference="nuts", inplace=False, progressbar=False, use_binned=use_binned,
         sample_kwargs={"draws": 2000, "tune": 1000, "chains": 2},
@@ -78,7 +82,9 @@ def test_exact_profiles_match_nuts():
     dvg.pp.bin_obs(adata, anchor="anchor", condition=None, n_bins=20)
     setup = dvg.tl.setup_model(adata)
     dvg.tl.fit_profiles(adata, setup, inference="exact", progressbar=False, profiles_key="ex")
-    dvg.tl.fit_profiles(adata, setup, inference="nuts", progressbar=False, profiles_key="nu", sample_kwargs={"draws": 2000})
+    dvg.tl.fit_profiles(
+        adata, setup, inference="nuts", progressbar=False, profiles_key="nu", sample_kwargs={"draws": 2000}
+    )
     np.testing.assert_allclose(adata.varm["ex_mean"], adata.varm["nu_mean"], atol=0.02)
 
 
@@ -183,10 +189,14 @@ def test_slope_test_detects_a_flattened_gradient():
     x[:4] = 0.0, 0.0, 1.0, 1.0
     cond = np.where(np.arange(n) % 2 == 0, "a", "b")
     b = (cond == "b").astype(float)
-    X = np.column_stack([x * (1 - 0.6 * b), x + 0.5 * b]) + 0.3 * rng.normal(size=(n, 2))  # flatter in b; parallel shift
+    X = np.column_stack([x * (1 - 0.6 * b), x + 0.5 * b]) + 0.3 * rng.normal(
+        size=(n, 2)
+    )  # flatter in b; parallel shift
     adata = ad.AnnData(X.astype(np.float32), var=pd.DataFrame(index=["flattened", "shifted"]))
     adata.obsm["design_matrix"] = pd.DataFrame({"anchor": x, "condition": cond}, index=adata.obs_names)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=20)
-    stats, _, _ = dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="slope", tau=0.0, inplace=False, progressbar=False)
+    stats, _, _ = dvg.tl.fit_model(
+        adata, dvg.tl.setup_model(adata), test="slope", tau=0.0, inplace=False, progressbar=False
+    )
     assert stats.loc["flattened", "slope_pval"] < 1e-6 and stats.loc["shifted", "slope_pval"] > 0.05
     assert abs(stats.loc["flattened", "slope_diff"] + 0.6) < 0.1
