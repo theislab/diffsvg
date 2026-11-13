@@ -1097,14 +1097,6 @@ def _coef_columns(n_bsplines):
 
 def _resolve_inference(inference, model_setup):
     """``"auto"`` picks exact inference where the model allows it (see `_exact.supported`), NUTS otherwise."""
-    if inference == "advi":
-        warnings.warn(
-            "inference='advi' was removed: the exact posterior replaces it (same model, no approximation, much "
-            "faster). Running inference='auto' instead; pass that to silence this warning.",
-            FutureWarning,
-            stacklevel=3,
-        )
-        inference = "auto"
     allowed = ("auto", "exact", *_INFERENCE)
     if inference not in allowed:
         raise ValueError(f"Unknown inference {inference!r}. Available: {sorted(allowed)}")

@@ -220,13 +220,3 @@ def test_anchor_support_is_the_central_cells_where_both_conditions_are():
     counts[0, 1] = 50  # one condition only: not part of the support
     assert np.allclose(_anchor_support(SimpleNamespace(n_obs_grid=counts, bin_centers=x)), (0.3, 0.8))
     assert _anchor_support(SimpleNamespace(n_obs_grid=None, bin_centers=x)) == (0.0, 1.0)
-
-
-def test_advi_is_an_alias_for_auto():
-    adata = _slides(n_per_slide=100)
-    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None)
-    with pytest.warns(FutureWarning, match="advi"):
-        stats, _, _ = dvg.tl.fit_model(
-            adata, dvg.tl.setup_model(adata), inference="advi", inplace=False, progressbar=False
-        )
-    assert stats["parallel_pval"].notna().all()
