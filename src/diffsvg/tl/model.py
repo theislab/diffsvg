@@ -1975,9 +1975,12 @@ def parallel_curves_test(beta_1, metric, tau=0.1, cov=None, df_denominator=None)
     if tau < 0:
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
 
-    # Q = L L' over its K - 1 non-zero directions, so z = L' beta_1 has |z| = shape_diff.
+    # Q = L L' over its non-negligible directions, so z = L' beta_1 has |z| = shape_diff. On part of the anchor
+    # range (see `_anchor_support`) a basis function at the edge has almost no weight; keeping such a direction
+    # makes the tau > 0 bound (tau^2 over its tiny variance) explode, so directions under 0.1% of the largest
+    # are dropped. On the full range every direction is above 4%.
     evals, evecs = np.linalg.eigh(np.asarray(metric, dtype=float))
-    keep = evals > evals.max() * 1e-10
+    keep = evals > evals.max() * 1e-3
     L = evecs[:, keep] * np.sqrt(evals[keep])
     z = L.T @ mean
     omega = L.T @ cov @ L
