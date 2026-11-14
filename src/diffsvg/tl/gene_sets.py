@@ -91,7 +91,10 @@ def _rotation_pvalues(Ymat, group, sets, n_rot, rng):
     t_obs = _t_from_rotated(U)
 
     def stats(t):
-        return {k: ((w * t[i]).sum() / np.abs(w).sum(), (np.abs(w) * np.abs(t[i])).sum() / np.abs(w).sum()) for k, (i, w) in sets.items()}
+        return {
+            k: ((w * t[i]).sum() / np.abs(w).sum(), (np.abs(w) * np.abs(t[i])).sum() / np.abs(w).sum())
+            for k, (i, w) in sets.items()
+        }
 
     observed = stats(t_obs)
     counts = {k: np.zeros(3) for k in sets}
