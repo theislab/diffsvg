@@ -30,6 +30,8 @@
     tl.fit_model
     tl.fit_profiles
     tl.one_vs_rest
+    tl.gene_set_test
+    tl.replicate_summaries
     tl.cluster_curves
     tl.check_stability
     tl.parallel_curves_test
