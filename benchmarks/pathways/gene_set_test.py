@@ -27,7 +27,8 @@ from diffsvg.tl.model import _anchor_support
 def replicate_summaries(binned):
     """(replicates x genes) level and slope, and the condition of each replicate."""
     lo, hi = _anchor_support(binned)
-    x_all = np.asarray(binned.bin_centers)[np.asarray(binned.bin_assignment)]
+    B, Bp = np.asarray(binned.B), np.asarray(binned.B_pred)  # each binned row sits on a grid point: match its basis row
+    x_all = np.asarray(binned.bin_centers)[((B[:, None, :] - Bp[None, :, :]) ** 2).sum(-1).argmin(1)]
     w_all = np.asarray(binned.n_obs, dtype=float)
     s_idx = np.asarray(binned.sample_index)
     cond = np.asarray(binned.condition_fit)
@@ -194,7 +195,7 @@ if args.mode == "liver":
     for tag, grp in splits:
         a.obsm["design_matrix"]["condition"] = np.where(np.isin(donor, list(grp)), "A_healthy", "B_fibrotic")  # A first -> 0
         dvg.pp.bin_obs(a, anchor="anchor", condition="condition", sample="donor")
-        lv, sl, rc = replicate_summaries(a.uns["binned"])
+        lv, sl, rc = replicate_summaries(dvg.tl.setup_model(a).binned)
         group = 1 - rc  # 1 = the "healthy" group, so positive t = higher/steeper in healthy
         run(lv, sl, group, sets, f"liver_{tag}", args.out, args.seed)
         print(f"rc=0 liver {tag}", flush=True)
@@ -225,7 +226,7 @@ elif args.mode == "legnini":
     for tag, grp in splits:
         dm["condition"] = np.where(dm["organoid"].isin(grp), "A_shh", "B_ctrl")
         dvg.pp.bin_obs(a, anchor="True", condition="condition", layer="log1p_norm", sample="organoid")
-        lv, sl, rc = replicate_summaries(a.uns["binned"])
+        lv, sl, rc = replicate_summaries(dvg.tl.setup_model(a).binned)
         run(lv, sl, 1 - rc, sets, f"legnini_{tag}", args.out, args.seed)
         print(f"rc=0 legnini {tag}", flush=True)
 
@@ -259,6 +260,6 @@ elif args.mode == "seaad_spike":
     a.layers["spiked"] = X
     a.obsm["design_matrix"] = pd.DataFrame({"depth": depth, "condition": np.where(in_a, "A", "B"), "donor": donor}, index=a.obs_names)
     dvg.pp.bin_obs(a, anchor="depth", condition="condition", layer="spiked", sample="donor")
-    lv, sl, rc = replicate_summaries(a.uns["binned"])
+    lv, sl, rc = replicate_summaries(dvg.tl.setup_model(a).binned)
     run(lv, sl, 1 - rc, sets, f"seaad_spike_seed{args.seed}", args.out, args.seed)
     print(f"rc=0 seaad_spike {args.seed}", flush=True)
