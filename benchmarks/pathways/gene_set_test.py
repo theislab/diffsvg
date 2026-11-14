@@ -92,8 +92,48 @@ def camera_rank(t_obs, Ymat, group, idx):
     return {"z": z, "p_up": float(norm.sf(z)), "p_down": float(norm.cdf(z)), "rho": rho}
 
 
+def two_sample_t(M, group):
+    """Per-gene two-sample t (pooled variance) of the replicate summaries: the input decoupler recommends."""
+    a, b = M[group == 1], M[group == 0]
+    n1, n0 = len(a), len(b)
+    sp = (((a - a.mean(0)) ** 2).sum(0) + ((b - b.mean(0)) ** 2).sum(0)) / (n1 + n0 - 2)
+    return (a.mean(0) - b.mean(0)) / np.sqrt(sp * (1 / n1 + 1 / n0))
+
+
+def decoupler_tests(M, group, net, tag, summary):
+    """decoupler ULM on the per-gene t vector, and ORA on the top 10% of genes by |t|."""
+    import decoupler as dc
+
+    t = pd.DataFrame([two_sample_t(M.to_numpy(), group)], index=[tag], columns=M.columns).fillna(0.0)
+    rows = []
+    es, pv = dc.mt.ulm(data=t, net=net, tmin=3, verbose=False)
+    for s in es.columns:
+        rows.append({"tag": tag, "summary": summary, "set": s, "method": "ulm", "score": es.iloc[0][s], "pval": pv.iloc[0][s]})
+    k = max(5, int(0.1 * t.shape[1]))
+    absval = t.abs()
+    es, pv = dc.mt.ora(data=absval, net=net.assign(weight=1.0), tmin=3, n_up=k, n_bm=0, n_bg=t.shape[1], verbose=False)  # background = the panel, not 20,000 genes
+    for s in es.columns:
+        rows.append({"tag": tag, "summary": summary, "set": s, "method": "ora_top10pct", "score": es.iloc[0][s], "pval": pv.iloc[0][s]})
+    return rows
+
+
+NET_EXTRA = None  # decoupler resources (hallmark, progeny), loaded once from data/
+
+
 def run(level, slope, group, sets, tag, out, seed):
     rows = []
+    net = pd.DataFrame([(k, g, 1.0) for k, v in sets.items() for g in v], columns=["source", "target", "weight"])
+    if NET_EXTRA is not None:
+        net = pd.concat([net, NET_EXTRA], ignore_index=True)
+    dec = []
+    for name, M in (("level", level), ("slope", slope)):
+        try:
+            dec += decoupler_tests(M, group, net, tag, name)
+        except Exception as e:  # noqa: BLE001 - report and keep the rotation results
+            print(f"decoupler failed for {tag} {name}: {e}", flush=True)
+    if dec:
+        os.makedirs(out, exist_ok=True)
+        pd.DataFrame(dec).to_csv(f"{out}/{tag}_decoupler.csv", index=False)
     for name, M in (("level", level), ("slope", slope)):
         genes = list(M.columns)
         idx = {k: np.array([genes.index(g) for g in v if g in genes]) for k, v in sets.items()}
@@ -115,6 +155,9 @@ p.add_argument("--data", required=True)
 p.add_argument("--out", required=True)
 p.add_argument("--seed", type=int, default=0)
 args = p.parse_args()
+_extra = [f for f in (f"{args.data}/decoupler_hallmark.csv", f"{args.data}/decoupler_progeny.csv") if os.path.exists(f)]
+if _extra:
+    NET_EXTRA = pd.concat([pd.read_csv(f)[["source", "target", "weight"]] for f in _extra], ignore_index=True)
 
 if args.mode == "liver":
     import anndata as ad
