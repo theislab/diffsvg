@@ -222,3 +222,26 @@ def test_anchor_support_is_the_central_cells_where_both_conditions_are():
     counts[0, 1] = 50  # one condition only: not part of the support
     assert np.allclose(_anchor_support(SimpleNamespace(n_obs_grid=counts, bin_centers=x)), (0.3, 0.8))
     assert _anchor_support(SimpleNamespace(n_obs_grid=None, bin_centers=x)) == (0.0, 1.0)
+
+
+def test_shape_test_with_tau_on_part_of_the_anchor_range():
+    """Cells on 0.04-0.9 only, so an edge basis function has almost no weight on the support.
+
+    The tau > 0 bound must ignore that direction: before the fix the tilted gene got p = 1 (as did every gene
+    of the pooled Legnini fit).
+    """
+    rng = np.random.default_rng(5)
+    n = 8000
+    x = rng.uniform(0.04, 0.9, n)
+    x[:2] = 0.0, 1.0  # keep [0, 1] as the anchor range
+    cond = np.where(np.arange(n) % 2 == 0, "a", "b")
+    b = (cond == "b").astype(float)
+    X = np.column_stack([np.sin(3 * x) + 0.8 * b * (x - 0.5), np.sin(3 * x)]) + 0.2 * rng.normal(size=(n, 2))
+    adata = ad.AnnData(X.astype(np.float32), var=pd.DataFrame(index=["tilted", "same"]))
+    adata.obsm["design_matrix"] = pd.DataFrame({"anchor": x, "condition": cond}, index=adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition")
+    stats, _, _ = dvg.tl.fit_model(
+        adata, dvg.tl.setup_model(adata), test="parallel", tau=0.1, inplace=False, progressbar=False
+    )
+    assert stats.loc["tilted", "parallel_pval"] < 1e-6
+    assert stats.loc["same", "parallel_pval"] > 0.05
