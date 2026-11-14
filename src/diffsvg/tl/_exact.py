@@ -175,8 +175,14 @@ def draws(post, gene, n_draws, rng):
 # ----------------------------------------------------------------------------------------------------------
 
 
-def slide_design(X_fixed, B, sample_index, n_samples):
-    """Columns for the slide effects: one-hot slide levels, then per slide its copy of the spline basis."""
+def slide_design(X_fixed, B, sample_index, n_samples, rotation=None):
+    """Columns for the slide effects: one-hot slide levels, then per slide its copy of the spline basis.
+
+    With `rotation` (orthonormal, K x K) each slide's curve uses ``B @ rotation``, so its first column can carry a
+    scale of its own (see `slide_posterior`'s `slope_prior`).
+    """
+    if rotation is not None:
+        B = B @ rotation
     n, K = B.shape
     onehot = np.zeros((n, n_samples))
     onehot[np.arange(n), sample_index] = 1.0
@@ -231,6 +237,8 @@ def slide_posterior(
     n_hyper=72,
     hyper_range=(1e-5, 5.0),
     n_nodes=9,
+    slope_prior=None,
+    n_hyper3=28,
 ):
     """Exact posterior of the fixed coefficients with slide effects integrated out, for every gene.
 
@@ -254,8 +262,15 @@ def slide_posterior(
     lev_logpdf, lev_params = _SIGMA_LOGPDF[level_prior[0]], level_prior[1:]
     cur_logpdf, cur_params = _SIGMA_LOGPDF[curve_prior[0]], curve_prior[1:]
 
-    log_grid = np.linspace(np.log(hyper_range[0]), np.log(hyper_range[1]), n_hyper)
-    hyper = [(a, b) for a in log_grid for b in log_grid]
+    # With `slope_prior` the slide curves have their own scale for the slope direction (the first column of each
+    # slide's rotated basis, see `slide_design`): three scales (level, slope, rest of the curve) on a coarser grid.
+    if slope_prior is None:
+        log_grid = np.linspace(np.log(hyper_range[0]), np.log(hyper_range[1]), n_hyper)
+        hyper = [(a, None, b) for a in log_grid for b in log_grid]
+    else:
+        log_grid = np.linspace(np.log(hyper_range[0]), np.log(hyper_range[1]), n_hyper3)
+        hyper = [(a, sl, b) for a in log_grid for sl in log_grid for b in log_grid]
+        slo_logpdf, slo_params = _SIGMA_LOGPDF[slope_prior[0]], slope_prior[1:]
     nodes, node_w = np.polynomial.hermite_e.hermegauss(n_nodes)  # for \int e^{-x^2/2} g(x) dx
 
     # Pass 1: per scale pair, eigendecomposition and per gene the log-weights of the sigma nodes.
@@ -263,8 +278,11 @@ def slide_posterior(
     log_w = np.empty((G, len(hyper), n_nodes))
     t_nodes = np.empty((G, len(hyper), n_nodes))
     start = 0.5 * np.log(np.maximum(yy / np.maximum(n_tot, 1.0), 1e-12))
-    for h, (la, lb) in enumerate(hyper):
-        s_full = np.concatenate([prior_sd, np.full(n_samples, np.exp(la)), np.full(n_samples * n_bsplines, np.exp(lb))])
+    for h, (la, ls, lb) in enumerate(hyper):
+        curve_sds = np.full(n_bsplines, np.exp(lb))
+        if ls is not None:
+            curve_sds[0] = np.exp(ls)
+        s_full = np.concatenate([prior_sd, np.full(n_samples, np.exp(la)), np.tile(curve_sds, n_samples)])
         d, U = np.linalg.eigh(s_full[:, None] * XtWX * s_full[None, :])
         d = np.clip(d, 0.0, None)
         c = U.T @ (s_full[:, None] * r)
@@ -276,6 +294,7 @@ def slide_posterior(
         log_w[:, h] = (
             vals + np.log(node_w)[None, :] + 0.5 * nodes[None, :] ** 2 + np.log(sd)[:, None]
             + lev_logpdf(np.exp(la), *lev_params) + la + cur_logpdf(np.exp(lb), *cur_params) + lb
+            + (0.0 if ls is None else slo_logpdf(np.exp(ls), *slo_params) + ls)
         )  # fmt: skip
         t_nodes[:, h] = t
     log_w -= logsumexp(log_w.reshape(G, -1), axis=1)[:, None, None]
@@ -317,10 +336,12 @@ def slide_posterior(
             u = cg[None, :] / (d[None, :] + s2) + np.sqrt(s2 / (d[None, :] + s2)) * rng.standard_normal((len(sel), p))
             out_draws[g, sel] = m[:n_fixed] + u @ Tf.T
 
-    a_idx = np.array([np.exp(a) for a, _ in hyper])
-    b_idx = np.array([np.exp(b) for _, b in hyper])
+    a_idx = np.array([np.exp(a) for a, _, _ in hyper])
+    b_idx = np.array([np.exp(b) for _, _, b in hyper])
+    s_idx = np.array([0.0 if s is None else np.exp(s) for _, s, _ in hyper])
     wh = w.sum(axis=2)  # (G, H)
-    on_edge = np.array([(a in (log_grid[0], log_grid[-1])) or (b in (log_grid[0], log_grid[-1])) for a, b in hyper])
+    ends = (log_grid[0], log_grid[-1])
+    on_edge = np.array([(a in ends) or (b in ends) or (s is not None and s in ends) for a, s, b in hyper])
     return {
         "mean": M1,
         "cov": cov,
@@ -328,5 +349,6 @@ def slide_posterior(
         "sigma2_mean": s2_mean,
         "level_sd_mean": wh @ a_idx,
         "curve_sd_mean": wh @ b_idx,
+        "slope_sd_mean": wh @ s_idx if slope_prior is not None else np.full(G, np.nan),
         "edge_mass": wh[:, on_edge].sum(axis=1),
     }

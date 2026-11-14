@@ -66,6 +66,8 @@ DEFAULT_PRIORS = {
     # Only used by fits with `sample` (see `bin_obs`): how far a slide's level / curve strays from its condition's.
     "sample_level_sd": ("halfnormal", 1.0),
     "sample_curve_sd": ("halfnormal", 1.0),
+    # How far a slide's linear slope strays from its condition's (exact inference; see `_slide_rotation`).
+    "sample_slope_sd": ("halfnormal", 1.0),
 }
 
 
@@ -323,6 +325,7 @@ class _FitShared:
     df_denominator: int | None = None
     # The anchor range the tests are computed over, see `_anchor_support`.
     support: tuple = (0.0, 1.0)
+    degree: int = 3
 
 
 @dataclass
@@ -628,7 +631,7 @@ def _summarise_gene(gene, idata, shared, fit_columns, moments=None):
 
 
 def _exact_settings(sample_kwargs):
-    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81, "n_hyper": 72}
+    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81, "n_hyper": 72, "n_hyper3": 28, "slope_scale": True}
     given = dict(sample_kwargs or {})
     ignored = sorted(set(given) - set(settings))
     if ignored:
@@ -657,12 +660,26 @@ def _exact_fit(design, Y, genes, weights, ss_within, priors, prior_names, n_bspl
     )
 
 
+def _slide_rotation(n_bsplines, degree, support):
+    """Orthonormal K x K basis change whose first column is the slope direction of a slide's curve coefficients.
+
+    The first column is ``g / |g|`` with ``g`` the least-squares slope functional on the support, so the other
+    columns change a slide's curve without changing its slope. Slides then get one scale for their slope and one
+    for the rest of their curve. With a single scale, donors that differ mostly in gradient made the joint tests'
+    error rate depend on the data.
+    """
+    g = _slope_weights(n_bsplines, degree, support=support)
+    R = np.linalg.qr(np.column_stack([g, np.eye(n_bsplines)]))[0][:, :n_bsplines]
+    return -R if R[:, 0] @ g < 0 else R
+
+
 def _exact_slide_results(shared, Y, genes, ss_within, settings):
     """Exact inference for the two-condition model with slide effects."""
     priors = _resolve_priors(shared.priors)
     K = shared.n_bsplines
     fixed = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
-    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples)
+    rotation = _slide_rotation(K, shared.degree, shared.support) if settings.get("slope_scale", True) else None
+    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples, rotation)
     sizes = {"intercept": 1, "categorical_beta": 1, "beta": K, "beta_1": K}
     names = ("intercept", "beta", "categorical_beta", "beta_1")
     m0 = np.concatenate([[priors[n][1]] * sizes[n] for n in names])
@@ -676,6 +693,7 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
         X, Ymat, shared.weights, fixed.shape[1], shared.n_samples, K, m0, s0, priors["sigma"],
         priors["sample_level_sd"], priors["sample_curve_sd"], extra_df, extra_ss, n_draws=settings["draws"],
         seeds=np.random.SeedSequence(settings["random_seed"]).spawn(len(genes)), n_hyper=settings.get("n_hyper", 72),
+        slope_prior=priors["sample_slope_sd"] if rotation is not None else None, n_hyper3=settings.get("n_hyper3", 28),
     )  # fmt: skip
     results = []
     for i, gene in enumerate(genes):
@@ -690,6 +708,7 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
             "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
             "sample_level_sd": float(res["level_sd_mean"][i]),
             "sample_curve_sd": float(res["curve_sd_mean"][i]),
+            "sample_slope_sd": float(res["slope_sd_mean"][i]),
             "exact_edge_mass": float(res["edge_mass"][i]),
         }
         results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(res["mean"][i], res["cov"][i])))
@@ -1443,6 +1462,7 @@ def fit_model(
             _slope_weights(binned.n_bsplines, binned.degree, support=support) if test in ("parallel", "slope") else None
         ),
         support=support,
+        degree=binned.degree,
         weights=weights,
         inference=inference,
         sample_index=sample_index,
