@@ -54,6 +54,7 @@ dev = [
 ]
 test = [
   "coverage>=7.10",
+  "decoupler",      # gene_set_test(method="ulm")
   "diffsvg[pymc]",
   "pytest",
   "pytest-cov",     # For VS Code’s coverage functionality
@@ -153,7 +154,7 @@ files = [ "src", "tests" ]
 overrides = [
   # These don't ship a `py.typed` marker and have no stub-only package on
   # PyPI, so mypy has no way to type-check calls into them regardless.
-  { module = [ "arviz.*", "joblib.*", "patsy.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
+  { module = [ "arviz.*", "decoupler.*", "joblib.*", "patsy.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
 ]
 
 [tool.pytest]

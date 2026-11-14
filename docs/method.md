@@ -37,3 +37,9 @@ The difference curve is `d(x) = f1(x) - f0(x) = categorical_beta + B(x) beta_1`.
 - `test="wald"` asks whether the curves differ at all, in level or shape: a Wald test of `d` against 0 with the posterior covariance, chi-square with `n_bsplines` degrees of freedom. It has no `tau`, so with many cells it is best used for ranking.
 
 `tl.one_vs_rest` applies the parallel test to pairs of genes fitted with `tl.fit_profiles` (one curve per gene, no condition), and `tl.cluster_curves` groups genes by their spline coefficients.
+
+## Gene sets
+
+With several slides per condition, `tl.gene_set_test` asks whether the genes of a set change together. Every slide contributes one level and one slope per gene, from a weighted least-squares line through its bin means on the anchor support (`tl.replicate_summaries`), so the slide is the unit of replication. The default rotation test (Wu et al. 2010, as limma's `roast`) compares the mean per-gene t of a set with random rotations of the slides' residuals; rotating all genes together keeps their correlation. Gene sets can be a dict of gene lists or a decoupler network (e.g. `decoupler.op.hallmark()`); `method="ulm"` runs decoupler's univariate linear model on the per-gene t values instead.
+
+On random splits of the slides (liver, 7 donors; organoids, 8; 34 to 68 splits each) the rotation test called 1 to 4% of sets at p < 0.05. Sets of 10 genes with a level shift of 2% in one group of a random SEA-AD donor split (27 donors) were detected in 80% of cases, while single genes with a 5% shift were detected in 45%. On panels of a few hundred genes, pathway collections such as Hallmark or PROGENy have few genes per set; curated sets of a few marker genes work better.
