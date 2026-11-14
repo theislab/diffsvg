@@ -118,10 +118,103 @@ def decoupler_tests(M, group, net, tag, summary):
     return rows
 
 
+def _trigamma_inverse(y):
+    from scipy.special import polygamma
+
+    x = 0.5 + 1 / y
+    for _ in range(50):
+        x += polygamma(1, x) * (1 - polygamma(1, x) / y) / polygamma(2, x)
+    return x
+
+
+def moderated_t(M, group, covariate):
+    """limma-trend: per-gene pooled variance with d = n - 2 df, shrunk toward a trend in `covariate` (Smyth 2004)."""
+    from scipy.special import digamma, polygamma
+    from scipy.stats import t as tdist
+
+    a, b = M[group == 1], M[group == 0]
+    n1, n0 = len(a), len(b)
+    d = n1 + n0 - 2
+    diff = a.mean(0) - b.mean(0)
+    s2 = (((a - a.mean(0)) ** 2).sum(0) + ((b - b.mean(0)) ** 2).sum(0)) / d
+    ok = (s2 > 0) & np.isfinite(covariate)
+    e = np.log(s2[ok]) - digamma(d / 2) + np.log(d / 2)
+    trend = np.polyval(np.polyfit(covariate[ok], e, 2), covariate)
+    excess = np.var(e - trend[ok], ddof=3) - polygamma(1, d / 2)
+    d0 = 2 * _trigamma_inverse(excess) if excess > 0 else 1e6
+    s02 = np.exp(trend + digamma(d0 / 2) - np.log(d0 / 2))
+    s2_mod = np.where(ok, (d0 * s02 + d * s2) / (d0 + d), np.nan)
+    unit = 1 / n1 + 1 / n0
+    se_plain, se_mod = np.sqrt(s2 * unit), np.sqrt(s2_mod * unit)
+    t_plain, t_mod = diff / se_plain, diff / se_mod
+    return {
+        "diff": diff, "se": se_plain, "p_plain": 2 * tdist.sf(np.abs(t_plain), d),
+        "se_mod": se_mod, "p_mod": 2 * tdist.sf(np.abs(t_mod), d + min(d0, 1e6)), "d0": np.full(len(diff), d0),
+    }  # fmt: skip
+
+
+def ash_normal(beta, se, n_iter=500):
+    """Adaptive shrinkage (Stephens 2017) with a point mass at 0 plus centred normals: shrunken effects and lfsr."""
+    from scipy.stats import norm
+
+    ok = np.isfinite(beta) & np.isfinite(se) & (se > 0)
+    b, s = beta[ok], se[ok]
+    sig = np.r_[0.0, np.geomspace(max(s.min() / 10, 1e-6), 2 * np.sqrt(max((b**2 - s**2).max(), s.max() ** 2)), 20)]
+    var = s[:, None] ** 2 + sig[None, :] ** 2
+    lik = norm.pdf(b[:, None], 0, np.sqrt(var))
+    pi = np.full(len(sig), 1 / len(sig))
+    pi[0] = 0.5
+    pi /= pi.sum()
+    prior_w = np.r_[10.0, np.ones(len(sig) - 1)]  # mild null-favouring penalty, as ashr's default
+    for _ in range(n_iter):
+        post = lik * pi
+        post /= post.sum(1, keepdims=True)
+        pi = (post.sum(0) + prior_w - 1) / (post.sum() + prior_w.sum() - len(sig))
+    post = lik * pi
+    post /= post.sum(1, keepdims=True)
+    # per component: posterior of beta is N(m, v) with m = b * sig2 / (sig2 + s2); component 0 is a point mass at 0
+    shrink = sig[None, :] ** 2 / var
+    m, v = b[:, None] * shrink, shrink * s[:, None] ** 2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_neg = np.where(v > 0, norm.cdf(0, m, np.sqrt(np.where(v > 0, v, 1))), 0.0)
+    p0 = post[:, 0]
+    p_less = (post[:, 1:] * p_neg[:, 1:]).sum(1)
+    p_greater = 1 - p0 - p_less
+    lfsr = np.minimum(p_less, p_greater) + p0
+    out = {k: np.full(len(beta), np.nan) for k in ("pm", "lfsr", "svalue")}
+    out["pm"][ok] = (post * m).sum(1)
+    out["lfsr"][ok] = lfsr
+    order = np.argsort(lfsr)
+    sv = np.empty(len(lfsr))
+    sv[order] = np.cumsum(lfsr[order]) / np.arange(1, len(lfsr) + 1)
+    out["svalue"][ok] = sv
+    out["pi0"] = np.full(len(beta), pi[0])
+    return out
+
+
+def low_n(level, slope, group, tag, out):
+    """Per gene: plain t, limma-trend moderated t, and ash shrinkage (on the moderated se)."""
+    from diffsvg.tl.model import _benjamini_hochberg as bh
+
+    rows = []
+    cov = np.log1p(np.abs(level.to_numpy()).mean(0))
+    for name, M in (("level", level), ("slope", slope)):
+        X = M.to_numpy()
+        mt = moderated_t(X, group, cov)
+        ash = ash_normal(mt["diff"], mt["se_mod"])
+        df = pd.DataFrame({"gene": M.columns, "summary": name, **mt, **ash})
+        df["q_plain"] = bh(np.nan_to_num(df.p_plain.to_numpy(), nan=1.0))
+        df["q_mod"] = bh(np.nan_to_num(df.p_mod.to_numpy(), nan=1.0))
+        rows.append(df)
+    os.makedirs(out, exist_ok=True)
+    pd.concat(rows).to_csv(f"{out}/{tag}_genes.csv", index=False)
+
+
 NET_EXTRA = None  # decoupler resources (hallmark, progeny), loaded once from data/
 
 
 def run(level, slope, group, sets, tag, out, seed):
+    low_n(level, slope, group, tag, out)
     rows = []
     net = pd.DataFrame([(k, g, 1.0) for k, v in sets.items() for g in v], columns=["source", "target", "weight"])
     if NET_EXTRA is not None:
