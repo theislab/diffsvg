@@ -12,6 +12,7 @@ changelog.md
 contributing.md
 references.md
 
+notebooks/replicates_tutorial
 notebooks/full_tutorial
 notebooks/test_comparison_legnini
 notebooks/single_slide_test
