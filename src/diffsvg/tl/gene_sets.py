@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from diffsvg._logging import SKIP_OWN_FRAMES, report_drop
 from diffsvg.tl.model import _anchor_support, _benjamini_hochberg
 
 
@@ -167,9 +168,15 @@ def gene_set_test(
     for name in summaries:
         M = tables[name]
         usable = M.columns[M.notna().all() & (M.std() > 0)]
-        sets = {k: v for k, v in _as_sets(gene_sets, list(usable)).items() if len(v[0]) >= min_size}
+        all_sets = _as_sets(gene_sets, list(usable))
+        sets = {k: v for k, v in all_sets.items() if len(v[0]) >= min_size}
+        report_drop(f"gene sets with fewer than {min_size} genes in the data", len(all_sets) - len(sets), len(all_sets))
         if not sets:
-            warnings.warn(f"No gene set has {min_size} or more genes in the data.", UserWarning, stacklevel=2)
+            warnings.warn(
+                f"No gene set has {min_size} or more genes in the data.",
+                UserWarning,
+                skip_file_prefixes=SKIP_OWN_FRAMES,
+            )
             continue
         Ymat = M[usable].to_numpy()
         if method == "rotation":
