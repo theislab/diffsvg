@@ -239,6 +239,8 @@ def slide_posterior(
     n_nodes=9,
     slope_prior=None,
     n_hyper3=28,
+    contrasts=None,
+    contrast_groups=None,
 ):
     """Exact posterior of the fixed coefficients with slide effects integrated out, for every gene.
 
@@ -304,6 +306,10 @@ def slide_posterior(
     M1 = np.zeros((G, n_fixed))
     M2 = np.zeros((G, n_fixed, n_fixed))
     s2_mean = np.zeros(G)
+    C = None if contrasts is None else np.asarray(contrasts, dtype=float)  # (n_fixed, m)
+    if C is not None:
+        W_h = w.sum(axis=2)  # (G, H) posterior mass of each scale combination
+        V_h = np.zeros((G, len(eig), C.shape[1]))  # variance of each contrast given the scales
     for h, (d, U, s_full) in enumerate(eig):
         Tf = (s_full[:, None] * U)[:n_fixed]  # (n_fixed, p)
         c = U.T @ (s_full[:, None] * r)  # (p, G)
@@ -317,6 +323,14 @@ def slide_posterior(
         var_w = (wk[:, :, None] * s2[:, :, None] * shrink).sum(axis=1)  # (G, p): sum_k w Var(u | .)
         M2 += (Tf[None] * var_w[:, None, :]) @ Tf.T
         s2_mean += (wk * s2).sum(axis=1)
+        if C is not None:
+            P2 = (Tf.T @ C) ** 2  # (p, m)
+            mass = np.maximum(W_h[:, h], 1e-300)[:, None]
+            cond_var = (var_w @ P2) / mass  # E[Var(c'theta | scales, sigma) | scales]
+            cm = mean @ C  # (G, n_nodes, m): contrast means per sigma node
+            cm_mean = (wk[:, :, None] * cm).sum(axis=1) / mass
+            node_var = (wk[:, :, None] * (cm - cm_mean[:, None, :]) ** 2).sum(axis=1) / mass
+            V_h[:, h] = cond_var + node_var
     cov = M2 - M1[:, :, None] * M1[:, None, :]
 
     # Draws of the fixed block from the mixture.
@@ -342,7 +356,17 @@ def slide_posterior(
     wh = w.sum(axis=2)  # (G, H)
     ends = (log_grid[0], log_grid[-1])
     on_edge = np.array([(a in ends) or (b in ends) or (s is not None and s in ends) for a, s, b in hyper])
+    eff_df = None
+    if C is not None:
+        # Satterthwaite: the test's variance is E[V] over the scales' posterior; its own uncertainty Var(V) gives
+        # the effective degrees of freedom 2 E[V]^2 / Var(V) (large when the scales are well determined).
+        if contrast_groups is not None:  # e.g. all shape directions: the variance of their sum (a trace)
+            V_h = np.stack([V_h[:, :, list(gr)].sum(axis=2) for gr in contrast_groups], axis=2)
+        EV = np.einsum("gh,ghm->gm", W_h, V_h)
+        VV = np.einsum("gh,ghm->gm", W_h, (V_h - EV[:, None, :]) ** 2)
+        eff_df = np.clip(2 * EV**2 / np.maximum(VV, 1e-300), 1.0, 1e4)
     return {
+        "eff_df": eff_df,
         "mean": M1,
         "cov": cov,
         "draws": out_draws,
