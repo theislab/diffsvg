@@ -674,31 +674,23 @@ def _slide_rotation(n_bsplines, degree, support):
 
 
 def _use_effective_df(stats_df, test, tau):
-    """Exact slide fits: compare the joint test with F on its effective df instead of ``n_slides - 2``.
+    """Exact slide fits, shape test at ``tau = 0``: F on ``max(n_slides - 2, shape_eff_df)`` denominator df.
 
-    ``n_slides - 2`` assumes the slide variance rests on one value per slide; the exact posterior pools it over
-    the slides and, for the curve, over the spline directions, which ``*_eff_df`` (Satterthwaite, from the
-    posterior of the variance scales) measures. On random slide splits ``n_slides - 2`` made the joint test
-    conservative (0 to 3% at p < 0.05) and chi-square slightly liberal in the tail.
+    The shape variance is pooled over the slides and the spline directions; ``shape_eff_df`` (Satterthwaite, from
+    the posterior of the variance scales) measures that pooling. With ``n_slides - 2`` alone the shape test was
+    conservative (0.1% at p < 0.05 on balanced organoid splits, 1% with the effective df). Level and slope keep
+    ``n_slides - 2``: their posterior variance already integrates the scale uncertainty, and the effective df
+    made them conservative.
     """
-    col = {"level": "level_eff_df", "slope": "slope_eff_df", "parallel": "shape_eff_df"}.get(test)
-    if col is None or col not in stats_df or f"{test}_stat" not in stats_df:
+    if test != "parallel" or tau != 0 or "shape_eff_df" not in stats_df or "parallel_stat" not in stats_df:
         return
-    nu = stats_df[col].to_numpy(dtype=float)
-    stat = stats_df[f"{test}_stat"].to_numpy(dtype=float)
-    pval = stats_df[f"{test}_pval"].to_numpy(dtype=float).copy()
+    nu = np.maximum(stats_df["shape_eff_df"].to_numpy(dtype=float), stats_df["parallel_df_denominator"].to_numpy(dtype=float))
+    stat, k = stats_df["parallel_stat"].to_numpy(dtype=float), stats_df["parallel_df"].to_numpy(dtype=float)
     ok = np.isfinite(nu) & np.isfinite(stat)
-    if test in ("level", "slope"):
-        var = np.where(stat > 0, stats_df[f"{test}_diff"].to_numpy(dtype=float) ** 2 / np.where(stat > 0, stat, 1), np.nan)
-        for i in np.flatnonzero(ok & np.isfinite(var) & (var > 0)):
-            pval[i] = _one_df_pval(stat[i], var[i], tau, nu[i])
-    elif tau == 0:  # the tau > 0 shape bound needs the shape covariance; it keeps n_slides - 2
-        k = stats_df["parallel_df"].to_numpy(dtype=float)
-        pval[ok] = f.sf(stat[ok] / k[ok], k[ok], nu[ok])
-    else:
-        return
-    stats_df[f"{test}_pval"] = pval
-    stats_df[f"{test}_df_denominator"] = np.where(ok, nu, stats_df[f"{test}_df_denominator"])
+    pval = stats_df["parallel_pval"].to_numpy(dtype=float).copy()
+    pval[ok] = f.sf(stat[ok] / k[ok], k[ok], nu[ok])
+    stats_df["parallel_pval"] = pval
+    stats_df["parallel_df_denominator"] = np.where(ok, nu, stats_df["parallel_df_denominator"])
 
 
 def _test_contrasts(shared):
