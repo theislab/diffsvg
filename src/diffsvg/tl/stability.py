@@ -179,10 +179,11 @@ def check_stability(
     inference
         Passed to `fit_model`.
     sample
-        Passed to `diffsvg.pp.bin_obs`: the slide column for data with several
-        slides per condition, so every run uses the model with slide effects
-        (needs ``window_radius=None`` and ``test="parallel"``). Without it,
-        multi-slide data is pooled and the rankings are over-confident.
+        Passed to `diffsvg.pp.bin_obs`: the replicate column for data with
+        several replicates per condition, so every run uses the model with
+        replicate effects (needs ``window_radius=None`` and ``test="parallel"``).
+        Without it, data with replicates is pooled and the rankings are
+        over-confident.
 
     Returns
     -------
