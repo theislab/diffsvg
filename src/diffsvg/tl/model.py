@@ -66,6 +66,8 @@ DEFAULT_PRIORS = {
     # Only used by fits with `sample` (see `bin_obs`): how far a slide's level / curve strays from its condition's.
     "sample_level_sd": ("halfnormal", 1.0),
     "sample_curve_sd": ("halfnormal", 1.0),
+    # How far a slide's linear slope strays from its condition's (exact inference; see `_slide_rotation`).
+    "sample_slope_sd": ("halfnormal", 1.0),
 }
 
 
@@ -323,6 +325,7 @@ class _FitShared:
     df_denominator: int | None = None
     # The anchor range the tests are computed over, see `_anchor_support`.
     support: tuple = (0.0, 1.0)
+    degree: int = 3
 
 
 @dataclass
@@ -628,7 +631,7 @@ def _summarise_gene(gene, idata, shared, fit_columns, moments=None):
 
 
 def _exact_settings(sample_kwargs):
-    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81, "n_hyper": 72}
+    settings = {"draws": 1000, "random_seed": 42, "n_grid": 81, "n_hyper": 72, "n_hyper3": 28, "slope_scale": True}
     given = dict(sample_kwargs or {})
     ignored = sorted(set(given) - set(settings))
     if ignored:
@@ -657,12 +660,69 @@ def _exact_fit(design, Y, genes, weights, ss_within, priors, prior_names, n_bspl
     )
 
 
+def _slide_rotation(n_bsplines, degree, support):
+    """Orthonormal K x K basis change whose first column is the slope direction of a slide's curve coefficients.
+
+    The first column is ``g / |g|`` with ``g`` the least-squares slope functional on the support, so the other
+    columns change a slide's curve without changing its slope. Slides then get one scale for their slope and one
+    for the rest of their curve. With a single scale, donors that differ mostly in gradient made the joint tests'
+    error rate depend on the data.
+    """
+    g = _slope_weights(n_bsplines, degree, support=support)
+    R = np.linalg.qr(np.column_stack([g, np.eye(n_bsplines)]))[0][:, :n_bsplines]
+    return -R if R[:, 0] @ g < 0 else R
+
+
+def _use_effective_df(stats_df, test, tau):
+    """Exact slide fits, shape test at ``tau = 0``: F on ``max(n_slides - 2, shape_eff_df)`` denominator df.
+
+    The shape variance is pooled over the slides and the spline directions; ``shape_eff_df`` (Satterthwaite, from
+    the posterior of the variance scales) measures that pooling. With ``n_slides - 2`` alone the shape test was
+    conservative (0.1% at p < 0.05 on balanced organoid splits, 1% with the effective df). Level and slope keep
+    ``n_slides - 2``: their posterior variance already integrates the scale uncertainty, and the effective df
+    made them conservative.
+    """
+    if test != "parallel" or tau != 0 or "shape_eff_df" not in stats_df or "parallel_stat" not in stats_df:
+        return
+    nu = np.maximum(
+        stats_df["shape_eff_df"].to_numpy(dtype=float), stats_df["parallel_df_denominator"].to_numpy(dtype=float)
+    )
+    stat, k = stats_df["parallel_stat"].to_numpy(dtype=float), stats_df["parallel_df"].to_numpy(dtype=float)
+    ok = np.isfinite(nu) & np.isfinite(stat)
+    pval = stats_df["parallel_pval"].to_numpy(dtype=float).copy()
+    pval[ok] = f.sf(stat[ok] / k[ok], k[ok], nu[ok])
+    stats_df["parallel_pval"] = pval
+    stats_df["parallel_df_denominator"] = np.where(ok, nu, stats_df["parallel_df_denominator"])
+
+
+def _test_contrasts(shared):
+    """Contrast vectors on ``theta`` for the level, the slope and the shape directions, for the effective df.
+
+    Columns: level (mean of ``f1 - f0`` over the support), slope (on ``beta_1``), then the shape directions of
+    `shape_metric` on the support (grouped, so their summed variance gets one df).
+    """
+    K = shared.n_bsplines
+    n_fixed = 2 * K + 2
+    A0, A1 = _condition_maps(shared)
+    level = (A1 - A0).T @ _level_weights(shared.bin_centers, shared.support)
+    slope = np.zeros(n_fixed)
+    slope[K + 2 :] = _slope_weights(K, shared.degree, support=shared.support)
+    evals, evecs = np.linalg.eigh(shape_metric(K, shared.degree, support=shared.support))
+    keep = evals > evals.max() * 1e-3
+    L = np.zeros((n_fixed, int(keep.sum())))
+    L[K + 2 :] = evecs[:, keep] * np.sqrt(evals[keep])
+    C = np.column_stack([level, slope, L])
+    return C, [[0], [1], list(range(2, C.shape[1]))]
+
+
 def _exact_slide_results(shared, Y, genes, ss_within, settings):
     """Exact inference for the two-condition model with slide effects."""
     priors = _resolve_priors(shared.priors)
     K = shared.n_bsplines
     fixed = np.column_stack([np.ones(shared.B.shape[0]), shared.B, shared.condition_fit, shared.B_masked])
-    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples)
+    rotation = _slide_rotation(K, shared.degree, shared.support) if settings.get("slope_scale", True) else None
+    contrasts, groups = _test_contrasts(shared)
+    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples, rotation)
     sizes = {"intercept": 1, "categorical_beta": 1, "beta": K, "beta_1": K}
     names = ("intercept", "beta", "categorical_beta", "beta_1")
     m0 = np.concatenate([[priors[n][1]] * sizes[n] for n in names])
@@ -676,6 +736,8 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
         X, Ymat, shared.weights, fixed.shape[1], shared.n_samples, K, m0, s0, priors["sigma"],
         priors["sample_level_sd"], priors["sample_curve_sd"], extra_df, extra_ss, n_draws=settings["draws"],
         seeds=np.random.SeedSequence(settings["random_seed"]).spawn(len(genes)), n_hyper=settings.get("n_hyper", 72),
+        slope_prior=priors["sample_slope_sd"] if rotation is not None else None, n_hyper3=settings.get("n_hyper3", 28),
+        contrasts=contrasts, contrast_groups=groups,
     )  # fmt: skip
     results = []
     for i, gene in enumerate(genes):
@@ -690,6 +752,10 @@ def _exact_slide_results(shared, Y, genes, ss_within, settings):
             "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
             "sample_level_sd": float(res["level_sd_mean"][i]),
             "sample_curve_sd": float(res["curve_sd_mean"][i]),
+            "sample_slope_sd": float(res["slope_sd_mean"][i]),
+            "level_eff_df": float(res["eff_df"][i, 0]),
+            "slope_eff_df": float(res["eff_df"][i, 1]),
+            "shape_eff_df": float(res["eff_df"][i, 2]),
             "exact_edge_mass": float(res["edge_mass"][i]),
         }
         results.append(_summarise_gene(gene, draws, shared, fit_columns, moments=(res["mean"][i], res["cov"][i])))
@@ -1443,6 +1509,7 @@ def fit_model(
             _slope_weights(binned.n_bsplines, binned.degree, support=support) if test in ("parallel", "slope") else None
         ),
         support=support,
+        degree=binned.degree,
         weights=weights,
         inference=inference,
         sample_index=sample_index,
@@ -1475,6 +1542,7 @@ def fit_model(
         curve_rows[gene] = curve_row
 
     stats_df = pd.DataFrame(stats_rows).set_index("gene").reindex(binned.genes)
+    _use_effective_df(stats_df, test, tau)
     if two_stage and n_samples is not None:
         two = _two_stage_stats(shared, Y, list(fit_genes), test, tau)
         if two is not None:
