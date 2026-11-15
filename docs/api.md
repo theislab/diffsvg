@@ -55,3 +55,15 @@
     pl.plot_cluster_curves
     pl.plot_stability
 ```
+
+## Datasets
+
+```{eval-rst}
+.. module:: diffsvg.datasets
+.. currentmodule:: diffsvg
+
+.. autosummary::
+    :toctree: generated
+
+    datasets.legnini23
+```
