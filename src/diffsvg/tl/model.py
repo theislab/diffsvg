@@ -684,7 +684,9 @@ def _use_effective_df(stats_df, test, tau):
     """
     if test != "parallel" or tau != 0 or "shape_eff_df" not in stats_df or "parallel_stat" not in stats_df:
         return
-    nu = np.maximum(stats_df["shape_eff_df"].to_numpy(dtype=float), stats_df["parallel_df_denominator"].to_numpy(dtype=float))
+    nu = np.maximum(
+        stats_df["shape_eff_df"].to_numpy(dtype=float), stats_df["parallel_df_denominator"].to_numpy(dtype=float)
+    )
     stat, k = stats_df["parallel_stat"].to_numpy(dtype=float), stats_df["parallel_df"].to_numpy(dtype=float)
     ok = np.isfinite(nu) & np.isfinite(stat)
     pval = stats_df["parallel_pval"].to_numpy(dtype=float).copy()
