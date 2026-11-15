@@ -12,16 +12,28 @@ diffsvg finds genes whose expression changes differently with the distance to an
 
 ```python
 import diffsvg as dvg
+import squidpy as sq
 
-# adata.obsm["design_matrix"] holds the distance to the anchor (e.g. from squidpy.tl.var_by_distance),
-# the condition and the replicate of every cell
-dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", sample="donor")
-setup = dvg.tl.setup_model(adata)
-dvg.tl.fit_model(adata, setup, test="parallel")
+# Distance of every cell to the nearest cell of the anchor group "tumor", per section, scaled to 0 to 1.
+# It is stored in adata.obsm["design_matrix"], in a column named after the group, next to the covariates.
+sq.tl.var_by_distance(
+    adata, cluster_key="region", groups="tumor", library_key="section", covariates=["condition", "donor"]
+)
+# Bin along the distance, with each donor as one replicate, and test every gene.
+dvg.pp.bin_obs(adata, anchor="tumor", condition="condition", sample="donor", layer="log1p")
+dvg.tl.fit_model(adata, dvg.tl.setup_model(adata), test="parallel")
 dvg.pl.plot_volcano(adata.varm["dsvg_stats"])
 ```
 
-See the [documentation][], in particular the tutorials and the [API documentation][].
+The results are in `adata.varm["dsvg_stats"]`, one row per gene, e.g. `shape_diff`, `slope_diff`, `parallel_pval` and `parallel_pval_adj` (Benjamini-Hochberg).
+
+Which page to read:
+
+- [Comparing conditions with replicates](https://diffsvg.readthedocs.io/page/notebooks/replicates_tutorial.html): start here, for data with 2 or more donors, animals or organoids per condition.
+- [Full tutorial](https://diffsvg.readthedocs.io/page/notebooks/full_tutorial.html): choosing the settings, and clustering genes by their curves.
+- [Comparing the tests](https://diffsvg.readthedocs.io/page/notebooks/test_comparison_legnini.html): how the Wald and shape tests and the replicate model differ.
+- [Single-slide test](https://diffsvg.readthedocs.io/page/notebooks/single_slide_test.html): one sample, one gene against the rest.
+- [Method](https://diffsvg.readthedocs.io/page/method.html) and the [API documentation][].
 
 ## Installation
 

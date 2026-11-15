@@ -14,14 +14,15 @@ and this project adheres to [Semantic Versioning][].
 
 - `tl.gene_set_test` and `tl.replicate_summaries`: gene-set tests with slides as replicates, as a rotation test (default) or with decoupler's univariate linear model; gene sets can be lists or decoupler networks ([#18](https://github.com/theislab/diffsvg/pull/18))
 - A separate slide scale for the slope direction of each slide's curve (`sample_slope_sd`), and the columns `level_eff_df`, `slope_eff_df` and `shape_eff_df` ([#19](https://github.com/theislab/diffsvg/pull/19))
+- `datasets.legnini23`: the Legnini et al. organoid data, downloaded from the scverse example-data CDN and pinned by sha256
 - Tutorial "Comparing conditions with replicates"
 
 ### Changed
 
-- With slides, the shape test at `tau = 0` uses F with `max(n_slides - 2, shape_eff_df)` denominator degrees of freedom. On balanced splits of organoids and liver donors, at most 1 of 18 splits had any gene at FDR < 0.05, and the shape test finds the SHH targets in the Legnini organoids ([#19](https://github.com/theislab/diffsvg/pull/19))
+- With replicates, the shape test at `tau = 0` uses F with `max(n_replicates - 2, shape_eff_df)` denominator degrees of freedom instead of `n_replicates - 2` ([#19](https://github.com/theislab/diffsvg/pull/19))
 - Exact fits with slides take about 4 times longer; `sample_kwargs={"slope_scale": False}` gives the previous model
 
-## [0.2.1] - 2026-11-13
+## [0.2.1] - 2026-11-14
 
 ### Fixed
 
@@ -35,17 +36,17 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
-- The condition tests use only the part of the anchor range where both conditions have cells; `fit_model` warns when that part covers less than 75% of the range ([#16](https://github.com/theislab/diffsvg/pull/16))
+- The condition tests on contiguous bins use only the part of the anchor range where both conditions have cells; with replicates and `two_stage=False`, `fit_model` warns when that part covers less than 75% of the range ([#16](https://github.com/theislab/diffsvg/pull/16))
 
 ### Removed
 
-- The `inference="advi"` alias
+- The `inference="advi"` alias ([#16](https://github.com/theislab/diffsvg/pull/16))
 
 ## [0.1.0] - 2026-11-12
 
 ### Added
 
-- Basic tool, preprocessing and plotting functions
+- Binning (`pp.bin_obs`), model setup and fitting (`tl.setup_model`, `tl.fit_model`), profiles and one-vs-rest tests (`tl.fit_profiles`, `tl.one_vs_rest`), stability checks (`tl.check_stability`) and plots (`pl.plot_volcano`, `pl.plot_prediction_curve`, `pl.plot_pvalue_histogram`)
 - `tl.cluster_curves` and `pl.plot_cluster_curves`: k-means on the coefficients of the combined curve or the interaction, which `fit_model` and `fit_profiles` now store
 - Exact posterior inference (`inference="auto"`, the default); PyMC, nutpie and arviz moved to the optional `pymc` extra ([#8](https://github.com/theislab/diffsvg/pull/8))
 - `test="level"` and `test="slope"`, and the Wald test with slides ([#10](https://github.com/theislab/diffsvg/pull/10))
@@ -60,3 +61,8 @@ and this project adheres to [Semantic Versioning][].
 ### Removed
 
 - ADVI inference; the exact posterior covers the same models ([#9](https://github.com/theislab/diffsvg/pull/9))
+
+[unreleased]: https://github.com/theislab/diffsvg/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/theislab/diffsvg/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/theislab/diffsvg/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/theislab/diffsvg/releases/tag/v0.1.0

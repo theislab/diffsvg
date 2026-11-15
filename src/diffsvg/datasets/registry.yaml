@@ -1,0 +1,13 @@
+base_url: https://exampledata.scverse.org/diffsvg
+
+datasets:
+  legnini23:
+    type: anndata
+    doc_header: Legnini et al. (2023) neural organoid-like cultures, 43,762 cells x 88 genes from 17 sections of 8 organoids (4 SHH, 4 Ctrl).
+    files:
+    - name: legnini23.h5ad
+      s3_key: legnini23.h5ad
+      sha256: 715407961adcb10263b79c1075d4e2f22677527a5e8c70ba8871e25890ede4c9
+      # CloudFront refuses some networks (e.g. HPC clusters); the bucket serves the same bytes.
+      fallback_urls:
+      - https://scverse-exampledata.s3.eu-west-1.amazonaws.com/diffsvg/legnini23.h5ad

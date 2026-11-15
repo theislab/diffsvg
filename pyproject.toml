@@ -32,6 +32,8 @@ dependencies = [
   "patsy",
   "scikit-learn",
   "scipy",
+  # example datasets (dvg.datasets), pinned by sha256
+  "scverse-misc[datasets]>=0.1.8",
   # for debug logging (referenced from the issue template)
   "session-info2",
   "tqdm",
@@ -154,7 +156,7 @@ files = [ "src", "tests" ]
 overrides = [
   # These don't ship a `py.typed` marker and have no stub-only package on
   # PyPI, so mypy has no way to type-check calls into them regardless.
-  { module = [ "arviz.*", "decoupler.*", "joblib.*", "patsy.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
+  { module = [ "arviz.*", "decoupler.*", "joblib.*", "patsy.*", "pooch.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
 ]
 
 [tool.pytest]
