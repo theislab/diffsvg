@@ -30,6 +30,8 @@
     tl.fit_model
     tl.fit_profiles
     tl.one_vs_rest
+    tl.gene_set_test
+    tl.replicate_summaries
     tl.cluster_curves
     tl.check_stability
     tl.parallel_curves_test
@@ -52,4 +54,16 @@
     pl.plot_prediction_curve
     pl.plot_cluster_curves
     pl.plot_stability
+```
+
+## Datasets
+
+```{eval-rst}
+.. module:: diffsvg.datasets
+.. currentmodule:: diffsvg
+
+.. autosummary::
+    :toctree: generated
+
+    datasets.legnini23
 ```

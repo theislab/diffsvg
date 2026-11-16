@@ -14,6 +14,7 @@ import logging
 import os
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -21,8 +22,10 @@ from joblib import Parallel, delayed
 from scipy import optimize
 from scipy.stats import chi2, f, gamma, ncf, ncx2
 from scipy.stats import t as student_t
+from scverse_misc import Deprecation, deprecated_arg
 from tqdm.auto import tqdm
 
+from diffsvg._logging import SKIP_OWN_FRAMES, log, report_drop
 from diffsvg.pp.utils import BinnedData, _bspline_basis_01, _expression, spline_basis_at
 from diffsvg.tl import _exact
 
@@ -636,9 +639,9 @@ def _exact_settings(sample_kwargs):
     ignored = sorted(set(given) - set(settings))
     if ignored:
         warnings.warn(
-            f"inference='exact' ignores the sampler settings {ignored} (it uses only draws, random_seed, n_grid, n_hyper).",
+            f"inference='exact' ignores the sampler settings {ignored} (it uses only {', '.join(settings)}).",
             UserWarning,
-            stacklevel=3,
+            skip_file_prefixes=SKIP_OWN_FRAMES,
         )
     settings.update({k: v for k, v in given.items() if k in settings})
     return settings
@@ -674,31 +677,25 @@ def _slide_rotation(n_bsplines, degree, support):
 
 
 def _use_effective_df(stats_df, test, tau):
-    """Exact slide fits: compare the joint test with F on its effective df instead of ``n_slides - 2``.
+    """Exact slide fits, shape test at ``tau = 0``: F on ``max(n_slides - 2, shape_eff_df)`` denominator df.
 
-    ``n_slides - 2`` assumes the slide variance rests on one value per slide; the exact posterior pools it over
-    the slides and, for the curve, over the spline directions, which ``*_eff_df`` (Satterthwaite, from the
-    posterior of the variance scales) measures. On random slide splits ``n_slides - 2`` made the joint test
-    conservative (0 to 3% at p < 0.05) and chi-square slightly liberal in the tail.
+    The shape variance is pooled over the slides and the spline directions; ``shape_eff_df`` (Satterthwaite, from
+    the posterior of the variance scales) measures that pooling. With ``n_slides - 2`` alone the shape test was
+    conservative (0.1% at p < 0.05 on balanced organoid splits, 1% with the effective df). Level and slope keep
+    ``n_slides - 2``: their posterior variance already integrates the scale uncertainty, and the effective df
+    made them conservative.
     """
-    col = {"level": "level_eff_df", "slope": "slope_eff_df", "parallel": "shape_eff_df"}.get(test)
-    if col is None or col not in stats_df or f"{test}_stat" not in stats_df:
+    if test != "parallel" or tau != 0 or "shape_eff_df" not in stats_df or "parallel_stat" not in stats_df:
         return
-    nu = stats_df[col].to_numpy(dtype=float)
-    stat = stats_df[f"{test}_stat"].to_numpy(dtype=float)
-    pval = stats_df[f"{test}_pval"].to_numpy(dtype=float).copy()
+    nu = np.maximum(
+        stats_df["shape_eff_df"].to_numpy(dtype=float), stats_df["parallel_df_denominator"].to_numpy(dtype=float)
+    )
+    stat, k = stats_df["parallel_stat"].to_numpy(dtype=float), stats_df["parallel_df"].to_numpy(dtype=float)
     ok = np.isfinite(nu) & np.isfinite(stat)
-    if test in ("level", "slope"):
-        var = np.where(stat > 0, stats_df[f"{test}_diff"].to_numpy(dtype=float) ** 2 / np.where(stat > 0, stat, 1), np.nan)
-        for i in np.flatnonzero(ok & np.isfinite(var) & (var > 0)):
-            pval[i] = _one_df_pval(stat[i], var[i], tau, nu[i])
-    elif tau == 0:  # the tau > 0 shape bound needs the shape covariance; it keeps n_slides - 2
-        k = stats_df["parallel_df"].to_numpy(dtype=float)
-        pval[ok] = f.sf(stat[ok] / k[ok], k[ok], nu[ok])
-    else:
-        return
-    stats_df[f"{test}_pval"] = pval
-    stats_df[f"{test}_df_denominator"] = np.where(ok, nu, stats_df[f"{test}_df_denominator"])
+    pval = stats_df["parallel_pval"].to_numpy(dtype=float).copy()
+    pval[ok] = f.sf(stat[ok] / k[ok], k[ok], nu[ok])
+    stats_df["parallel_pval"] = pval
+    stats_df["parallel_df_denominator"] = np.where(ok, nu, stats_df["parallel_df_denominator"])
 
 
 def _test_contrasts(shared):
@@ -1187,31 +1184,27 @@ def _resolve_inference(inference, model_setup):
     return resolved
 
 
-def _warn_predictive_seed(predictive_seed):
-    if predictive_seed is not None:
-        warnings.warn(
-            "`predictive_seed` no longer has an effect: the curves are now the posterior of the mean function, "
-            "computed from the posterior draws without new random draws.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+_PREDICTIVE_SEED = Deprecation(
+    "0.1.0",
+    "It has no effect: the curves are the posterior of the mean function, computed without new random draws.",
+)
 
 
 def _fittable_genes(genes, Y):
     """The genes worth fitting.
 
-    Genes whose fitted rows are constant (e.g. all zero) are left out with a warning: the model reproduces
+    Genes whose fitted rows are constant (e.g. all zero) are left out and reported (`report_drop`): the model reproduces
     them exactly, so the noise scale has no lower bound and the posterior is improper (the sampler diverges
     and the test would be meaningless). Their stats stay missing.
     """
     degenerate = [g for g in genes if not np.isfinite(Y[g]).all() or np.ptp(np.asarray(Y[g], dtype=float)) == 0]
     if degenerate:
         shown = ", ".join(degenerate[:10]) + (" ..." if len(degenerate) > 10 else "")
-        warnings.warn(
-            f"{len(degenerate)} gene(s) are constant or non-finite over the fitted rows and were not fitted "
-            f"(their stats are missing): {shown}",
-            UserWarning,
-            stacklevel=3,
+        report_drop(
+            "genes, constant or non-finite over the fitted rows (their stats are missing)",
+            len(degenerate),
+            len(genes),
+            shown,
         )
     return [g for g in genes if g not in set(degenerate)]
 
@@ -1238,10 +1231,11 @@ def _warn_unsupported_range(binned):
             f"Part of the anchor range has no cells in one condition ({detail} of the grid empty). The curves "
             "there are extrapolated from the spline and the prior, which inflates `shape_diff`/`integral`.",
             UserWarning,
-            stacklevel=3,
+            skip_file_prefixes=SKIP_OWN_FRAMES,
         )
 
 
+@deprecated_arg("predictive_seed", _PREDICTIVE_SEED)
 def fit_model(
     adata,
     model_setup,
@@ -1441,6 +1435,7 @@ def fit_model(
         raise ValueError(f"Unknown test {test!r}. Available: {sorted(_TESTS)}")
     if tau is not None and tau < 0:
         raise ValueError(f"`tau` must be >= 0, got {tau}.")
+    start = datetime.now()
     inference = _resolve_inference(inference, model_setup)
     if inference == "exact":
         sample_defaults = _exact_settings({**(sample_kwargs or {}), **pymc_kwargs})
@@ -1472,15 +1467,14 @@ def fit_model(
         tau = 0.0 if n_samples is not None else 0.1
     if n_samples is not None:
         if n_samples < 3:
-            raise ValueError(f"Comparing conditions across slides needs at least 3 slides, found {n_samples}.")
+            raise ValueError(f"Comparing conditions across replicates needs at least 3 replicates, found {n_samples}.")
     if test == "parallel" and use_binned and not binned.weighted:
         warnings.warn(
             "test='parallel' on overlapping bins: neighbouring bins share cells, so the p-values come out too "
             "small. Re-run `diffsvg.pp.bin_obs(..., window_radius=None)`, or fit with `use_binned=False`.",
             UserWarning,
-            stacklevel=2,
+            skip_file_prefixes=SKIP_OWN_FRAMES,
         )
-    _warn_predictive_seed(predictive_seed)
     if n_samples is not None:
         _check_slides_per_condition(binned, sample_index, condition_fit)
     if use_binned and binned.condition is not None and binned.n_obs_grid is not None:
@@ -1489,11 +1483,11 @@ def fit_model(
     support = _anchor_support(binned) if use_binned else (0.0, 1.0)
     if n_samples is not None and not two_stage and support[1] - support[0] < 0.75:
         warnings.warn(
-            f"The cells cover only {support[0]:.2f} to {support[1]:.2f} of the anchor range. With slides, the "
-            "joint model's test can be overconfident there (random slide splits of cell types confined to part of "
+            f"The cells cover only {support[0]:.2f} to {support[1]:.2f} of the anchor range. With replicates, the "
+            "joint model's test can be overconfident there (random replicate splits of cell types confined to part of "
             "the range gave false hits); `two_stage=True` stays calibrated.",
             UserWarning,
-            stacklevel=2,
+            skip_file_prefixes=SKIP_OWN_FRAMES,
         )
     shared = _FitShared(
         B=B,
@@ -1557,6 +1551,13 @@ def fit_model(
     test_params = {"test": test, "tau": float(tau)} if test in ("parallel", "level", "slope") else {"test": test}
     test_params["two_stage"] = bool(two_stage and n_samples is not None)
     test_params["anchor_support"] = [float(v) for v in support]
+    log.info(
+        "fit_model: %d genes, test=%r, tau=%g, %s inference, %s, anchor support %.2f to %.2f%s",
+        len(fit_genes), test, tau, inference,
+        f"{n_samples} replicates ({binned.sample!r})" if n_samples is not None else "no replicates",
+        *support, ", two-stage test" if test_params["two_stage"] else "",
+        time=start,
+    )  # fmt: skip
 
     # Column labels must be strings (not e.g. plain floats) so that
     # `adata.varm[...]` round-trips through h5ad, whose DataFrame writer
@@ -1603,6 +1604,7 @@ def fit_model(
 _PROFILE_SUFFIXES = ("mean", "ci_low", "ci_high")
 
 
+@deprecated_arg("predictive_seed", _PREDICTIVE_SEED)
 def fit_profiles(
     adata,
     model_setup,
@@ -1690,7 +1692,6 @@ def fit_profiles(
         raise ValueError("`fit_profiles` does not model slides; bin without `sample`.")
     B, _, _, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
     weights, ss_within, n_obs_grid = _weighting(binned, use_binned)
-    _warn_predictive_seed(predictive_seed)
     fit_genes = _fittable_genes(binned.genes, Y)
     shared = _ProfileShared(
         B=B,
@@ -2005,26 +2006,26 @@ def parallel_curves_test(beta_1, metric, tau=0.1, cov=None, df_denominator=None)
     measured, while the p-value stays valid for every difference up to `tau`.
 
     With `df_denominator` (replicates: the posterior covariance then holds
-    the variation between slides, which was estimated from only a few) the
+    the variation between replicates, which was estimated from only a few) the
     statistic over its ``K - 1`` degrees of freedom is compared against an F
     distribution instead (noncentral for ``tau > 0``, with the same
     noncentrality), which is wider than the chi-square and so keeps the test
-    honest when there are few slides.
+    honest when there are few replicates.
 
     Parameters
     ----------
-    beta_1 : array, shape (n_draws, K) or (K,)
-        Posterior draws of the interaction coefficients, or their posterior
-        mean (then `cov` is required).
-    metric : array, shape (K, K)
-        `shape_metric` for the basis `beta_1` belongs to.
+    beta_1 : numpy.ndarray
+        Posterior draws of the interaction coefficients, shape ``(n_draws, K)``,
+        or their posterior mean, shape ``(K,)`` (then `cov` is required).
+    metric : numpy.ndarray
+        `shape_metric` for the basis `beta_1` belongs to, shape ``(K, K)``.
     tau : float
         Smallest shape difference that counts, in units of ``shape_diff``.
-    cov : array, shape (K, K), optional
-        Posterior covariance of `beta_1`, when `beta_1` is a mean.
+    cov : numpy.ndarray, optional
+        Posterior covariance of `beta_1`, shape ``(K, K)``, when `beta_1` is a mean.
     df_denominator : int, optional
         Denominator degrees of freedom of the F reference, e.g. the number
-        of slides minus 2 when comparing two groups of slides.
+        of replicates minus 2 when comparing two groups of replicates.
 
     Returns
     -------
@@ -2038,6 +2039,7 @@ def parallel_curves_test(beta_1, metric, tau=0.1, cov=None, df_denominator=None)
     df : int
         Degrees of freedom, ``K - 1``.
     pval : float
+        p-value of ``H0: shape_diff <= tau``.
     """
     beta_1 = np.asarray(beta_1, dtype=float)
     if beta_1.ndim == 2:

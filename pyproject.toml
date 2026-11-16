@@ -32,6 +32,8 @@ dependencies = [
   "patsy",
   "scikit-learn",
   "scipy",
+  # example datasets (dvg.datasets), pinned by sha256
+  "scverse-misc[datasets]>=0.1.8",
   # for debug logging (referenced from the issue template)
   "session-info2",
   "tqdm",
@@ -54,24 +56,19 @@ dev = [
 ]
 test = [
   "coverage>=7.10",
+  "decoupler",      # gene_set_test(method="ulm")
   "diffsvg[pymc]",
-  "pytest",
+  "pytest>=9.1",    # caplog captures the non-propagating `scverse` logger from 9.1 on
   "pytest-cov",     # For VS Code’s coverage functionality
 ]
 doc = [
   "ipykernel",
   "ipython",
-  "myst-nb>=1.1",
   "pandas",
-  "scverse-misc[sphinx]>=0.1.2",
-  "sphinx>=8.1",
+  "scverse-doc[full]>=0.5",
+  "scverse-misc[sphinx]>=0.1.8",
   "sphinx-autodoc-typehints",
-  "sphinx-book-theme>=1",
-  "sphinx-copybutton",
-  "sphinx-design",
   "sphinxcontrib-bibtex>=1",
-  "sphinxcontrib-katex",
-  "sphinxext-opengraph",
 ]
 typecheck = [
   "mypy",
@@ -153,7 +150,7 @@ files = [ "src", "tests" ]
 overrides = [
   # These don't ship a `py.typed` marker and have no stub-only package on
   # PyPI, so mypy has no way to type-check calls into them regardless.
-  { module = [ "arviz.*", "joblib.*", "patsy.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
+  { module = [ "arviz.*", "decoupler.*", "joblib.*", "patsy.*", "pooch.*", "pymc.*", "sklearn.*" ], ignore_missing_imports = true },
 ]
 
 [tool.pytest]

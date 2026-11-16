@@ -245,3 +245,69 @@ def test_shape_test_with_tau_on_part_of_the_anchor_range():
     )
     assert stats.loc["tilted", "parallel_pval"] < 1e-6
     assert stats.loc["same", "parallel_pval"] > 0.05
+
+
+def _gene_set_data(shift, seed=0):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for s in range(8):
+        cond = "a" if s < 4 else "b"
+        slide_effect = rng.normal(0, 0.3, 30)  # slide-level variation of every gene
+        for _ in range(200):
+            xi = rng.random()
+            y = np.sin(3 * xi) + slide_effect + rng.normal(0, 0.3, 30)
+            if cond == "b":
+                y[:6] += shift  # the first six genes form the changing set
+            rows.append((xi, cond, f"s{s}", *y))
+    cols = [f"g{i}" for i in range(30)]
+    df = pd.DataFrame(rows, columns=["anchor", "condition", "slide", *cols])
+    df.loc[df.index[:2], "anchor"] = [0.0, 1.0]
+    adata = ad.AnnData(df[cols].to_numpy(np.float32), var=pd.DataFrame(index=cols))
+    adata.obsm["design_matrix"] = df[["anchor", "condition", "slide"]].set_index(adata.obs_names)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", sample="slide")
+    return dvg.tl.setup_model(adata)
+
+
+def test_gene_set_test_finds_a_shifted_set_and_accepts_decoupler_networks():
+    setup = _gene_set_data(shift=0.6)
+    sets = {
+        "changed": [f"g{i}" for i in range(6)],
+        "unchanged": [f"g{i}" for i in range(10, 16)],
+        "tiny": ["g20", "g21"],
+    }
+    res = dvg.tl.gene_set_test(setup, sets, summary="level", n_rotations=999).set_index("set")
+    assert "tiny" not in res.index  # below min_size
+    assert res.loc["changed", "pval_up"] < 0.01 and res.loc["changed", "mean_t"] > 0
+    assert res.loc["unchanged", "pval"] > 0.05
+    net = pd.DataFrame([(k, g) for k, v in sets.items() for g in v], columns=["source", "target"])
+    res_net = dvg.tl.gene_set_test(setup, net, summary="level", n_rotations=999).set_index("set")
+    assert np.isclose(res_net.loc["changed", "mean_t"], res.loc["changed", "mean_t"])
+
+
+def test_gene_set_test_needs_slides():
+    adata = _slides(n_per_slide=100)
+    dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None)
+    with pytest.raises(ValueError, match="sample"):
+        dvg.tl.gene_set_test(dvg.tl.setup_model(adata), {"s": list(adata.var_names)})
+
+
+def test_rotation_test_is_calibrated_on_noise():
+    from diffsvg.tl.gene_sets import _rotation_pvalues
+
+    rng = np.random.default_rng(1)
+    group = np.array([1, 1, 1, 0, 0, 0, 0], dtype=float)
+    hits = 0
+    for _ in range(300):
+        Y = rng.normal(size=(7, 40))
+        Y[:, :8] += rng.normal(size=(7, 1))  # a correlated set
+        res, _ = _rotation_pvalues(Y, group, {"s": (np.arange(8), np.ones(8))}, 199, rng)
+        hits += res["s"][1] < 0.05
+    assert 0.01 < hits / 300 < 0.1
+
+
+def test_gene_set_test_ulm_via_decoupler():
+    pytest.importorskip("decoupler")
+    setup = _gene_set_data(shift=0.6)
+    sets = {"changed": [f"g{i}" for i in range(6)], "unchanged": [f"g{i}" for i in range(10, 16)]}
+    res = dvg.tl.gene_set_test(setup, sets, summary="level", method="ulm").set_index("set")
+    assert res.loc["changed", "mean_t"] > 0 and res.loc["changed", "pval"] < 0.05
