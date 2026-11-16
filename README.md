@@ -30,7 +30,7 @@ The development version installs with `pip install git+https://github.com/theisl
 
 ## Release notes
 
-See the [changelog][].
+See the [GitHub releases](https://github.com/theislab/diffsvg/releases).
 
 ## Contact
 
@@ -45,4 +45,3 @@ If you found a bug, please use the [issue tracker][].
 [issue tracker]: https://github.com/theislab/diffsvg/issues
 [tests]: https://github.com/theislab/diffsvg/actions/workflows/test.yaml
 [documentation]: https://diffsvg.readthedocs.io
-[changelog]: https://diffsvg.readthedocs.io/page/changelog.html

@@ -28,7 +28,6 @@ notebooks/without_replicates
 method.md
 api.md
 logging.md
-changelog.md
 ```
 
 ```{toctree}
