@@ -12,6 +12,7 @@ import diffsvg as dvg
 p = argparse.ArgumentParser()
 p.add_argument("--data", required=True); p.add_argument("--split", required=True); p.add_argument("--test", required=True)
 p.add_argument("--datadir", required=True); p.add_argument("--out", required=True)
+p.add_argument("--n-hyper3", type=int, default=None, help="grid points per replicate scale (default: package default)")
 args = p.parse_args()
 
 if args.data == "legnini":
@@ -50,8 +51,9 @@ if args.data == "legnini":  # 4 vs 4: a split and its complement are the same pa
 grp = set(pos) if args.split == "real" else splits[int(args.split)]
 dm["condition"] = np.where(np.isin(labels, list(grp)), "A", "B")
 dvg.pp.bin_obs(a, anchor=anchor, condition="condition", layer=layer, sample=unit)
-st, _, _ = dvg.tl.fit_model(a, dvg.tl.setup_model(a), inplace=False, progressbar=False, test=args.test)
+kw = {} if args.n_hyper3 is None else {"sample_kwargs": {"n_hyper3": args.n_hyper3}}
+st, _, _ = dvg.tl.fit_model(a, dvg.tl.setup_model(a), inplace=False, progressbar=False, test=args.test, **kw)
 os.makedirs(args.out, exist_ok=True)
-tag = f"{args.data}_{args.split}_{args.test}"
+tag = f"{args.data}_{args.split}_{args.test}" + (f"_h{args.n_hyper3}" if args.n_hyper3 else "")
 st.to_csv(f"{args.out}/{tag}.csv")
 print(f"rc=0 {tag}: n_splits {len(splits)}, FDR {int((st[args.test + '_pval_adj'] < .05).sum())}", flush=True)
