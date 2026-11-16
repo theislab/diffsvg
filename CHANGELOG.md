@@ -12,15 +12,19 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
-- `tl.gene_set_test` and `tl.replicate_summaries`: gene-set tests with slides as replicates, as a rotation test (default) or with decoupler's univariate linear model; gene sets can be lists or decoupler networks ([#18](https://github.com/theislab/diffsvg/pull/18))
-- A separate slide scale for the slope direction of each slide's curve (`sample_slope_sd`), and the columns `level_eff_df`, `slope_eff_df` and `shape_eff_df` ([#19](https://github.com/theislab/diffsvg/pull/19))
+- `tl.gene_set_test` and `tl.replicate_summaries`: gene-set tests with replicates, as a rotation test (default) or with decoupler's univariate linear model; gene sets can be lists or decoupler networks ([#18](https://github.com/theislab/diffsvg/pull/18))
+- A separate replicate scale for the slope direction of each replicate's curve (`sample_slope_sd`), and the columns `level_eff_df`, `slope_eff_df` and `shape_eff_df` ([#19](https://github.com/theislab/diffsvg/pull/19))
 - `datasets.legnini23`: the Legnini et al. organoid data, downloaded from the scverse example-data CDN and pinned by sha256
-- Tutorial "Comparing conditions with replicates"
+- Logging through the shared scverse logger (`scverse.diffsvg`): `fit_model` reports its choices and run time, and `bin_obs` and `gene_set_test` report what they leave out; see the logging page ([#21](https://github.com/theislab/diffsvg/pull/21))
+- Docs: "diffsvg in 10 minutes", and guides for comparing conditions with replicates, choosing settings and clustering curves, and data without replicates; the method page has a validation section
 
 ### Changed
 
+- Warnings point at the caller's line, and `predictive_seed` warns with a `FutureWarning` through `scverse_misc.deprecated_arg` ([#21](https://github.com/theislab/diffsvg/pull/21))
+- The docs are built with `scverse-doc` ([#21](https://github.com/theislab/diffsvg/pull/21))
+- Docs: `full_tutorial` is now `settings_and_clustering`, `single_slide_test` is now `without_replicates`, and the test-comparison notebook is replaced by the Validation section of the method page
 - With replicates, the shape test at `tau = 0` uses F with `max(n_replicates - 2, shape_eff_df)` denominator degrees of freedom instead of `n_replicates - 2` ([#19](https://github.com/theislab/diffsvg/pull/19))
-- Exact fits with slides take about 4 times longer; `sample_kwargs={"slope_scale": False}` gives the previous model
+- Exact fits with replicates take about 4 times longer; `sample_kwargs={"slope_scale": False}` gives the previous model
 
 ## [0.2.1] - 2026-11-14
 
