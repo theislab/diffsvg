@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning][].
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - `tl.gene_set_test` and `tl.replicate_summaries`: gene-set tests with replicates, as a rotation test (default) or with decoupler's univariate linear model; gene sets can be lists or decoupler networks ([#18](https://github.com/theislab/diffsvg/pull/18))
@@ -66,7 +68,8 @@ and this project adheres to [Semantic Versioning][].
 
 - ADVI inference; the exact posterior covers the same models ([#9](https://github.com/theislab/diffsvg/pull/9))
 
-[unreleased]: https://github.com/theislab/diffsvg/compare/v0.2.1...HEAD
+[unreleased]: https://github.com/theislab/diffsvg/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/theislab/diffsvg/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/theislab/diffsvg/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/theislab/diffsvg/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/theislab/diffsvg/releases/tag/v0.1.0
