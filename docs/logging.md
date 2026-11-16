@@ -1,4 +1,4 @@
-# Settings
+# Logging
 
 diffsvg logs through the shared scverse logger, as `scverse.diffsvg`. One setting controls diffsvg and every other scverse package that uses it:
 

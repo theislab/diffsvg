@@ -5,12 +5,19 @@
 ```{toctree}
 :hidden: true
 :maxdepth: 1
-:caption: Tutorials
+:caption: Getting started
+
+notebooks/quickstart
+```
+
+```{toctree}
+:hidden: true
+:maxdepth: 1
+:caption: Guides
 
 notebooks/replicates_tutorial
-notebooks/full_tutorial
-notebooks/test_comparison_legnini
-notebooks/single_slide_test
+notebooks/settings_and_clustering
+notebooks/without_replicates
 ```
 
 ```{toctree}
@@ -19,9 +26,15 @@ notebooks/single_slide_test
 :caption: Reference
 
 method.md
-settings.md
 api.md
+logging.md
 changelog.md
+```
+
+```{toctree}
+:hidden: true
+:maxdepth: 1
+:caption: Development
+
 contributing.md
-references.md
 ```
