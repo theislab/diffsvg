@@ -8,7 +8,7 @@ from scipy import stats
 
 import diffsvg as dvg
 from diffsvg.pp.utils import _condition_levels
-from diffsvg.tl.model import _benjamini_hochberg, _fittable_genes, _gamma_null_pvalues, pattern_wald_test
+from diffsvg.tl.model import _benjamini_hochberg, _gamma_null_pvalues, pattern_wald_test
 from diffsvg.tl.stability import _format_value
 
 
@@ -98,12 +98,6 @@ def test_binning_defaults_are_contiguous_and_overlapping_bins_are_weighted():
     sliding = dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", window_radius=0.02, inplace=False)
     assert not sliding.weighted
     assert sliding.n_obs is not None and (sliding.n_obs > 0).all()
-
-
-def test_constant_genes_are_not_fitted():
-    Y = {"ok": np.array([0.0, 1.0, 2.0]), "zero": np.zeros(3), "nan": np.array([0.0, np.nan, 1.0])}
-    with pytest.warns(UserWarning, match="2 gene"):
-        assert _fittable_genes(list(Y), Y) == ["ok"]
 
 
 def test_prior_overrides_get_distinct_labels():

@@ -8,6 +8,8 @@ import pandas as pd
 import patsy
 from scipy.sparse import csr_matrix, issparse
 
+from diffsvg._logging import SKIP_OWN_FRAMES, report_drop
+
 
 def _expression(adata, genes, layer):
     """Dense float ``(n_obs, n_genes)`` expression of `genes`, from ``adata.layers[layer]`` or ``adata.X``."""
@@ -96,6 +98,10 @@ def bin_counts(
     for k, c in enumerate(categories):
         cat_code[cat == c] = k
     present = (cat_code >= 0) & np.isfinite(value)
+    report_drop(
+        "cells without a distance or category (anchor cells, or sections without anchor cells)",
+        int((~present).sum()), len(present),
+    )  # fmt: skip
     if contiguous:
         nearest = _nearest_bin(value, n_bins)
         cells = np.flatnonzero(present)
@@ -364,12 +370,12 @@ def _warn_possible_replicates(design_matrix_df, anchor, condition):
         per_condition = pairs.groupby("c", observed=True)["s"].nunique()
         if nested and len(per_condition) == 2 and per_condition.min() >= 2:
             warnings.warn(
-                f"Column {col!r} looks like replicates (slides/samples) nested in {condition!r} "
+                f"Column {col!r} looks like replicates (e.g. donors or organoids) nested in {condition!r} "
                 f"({per_condition.min()}+ per condition), but `sample` was not given, so every cell is treated as "
-                f"an independent replicate and slide-to-slide variation counts as a condition effect. Pass "
+                f"an independent replicate and variation between replicates counts as a condition effect. Pass "
                 f"`sample={col!r}` to model it.",
                 UserWarning,
-                stacklevel=3,
+                skip_file_prefixes=SKIP_OWN_FRAMES,
             )
             return
 
@@ -456,11 +462,13 @@ def bin_obs(
         ``adata.obsm`` key of the design matrix. Defaults to
         ``"design_matrix"``.
     sample
-        Column in ``adata.obsm["design_matrix"]`` naming the slide (replicate) of every cell, for data with
-        several slides per `condition`. Each slide must belong to one `condition`. Bins are then built per slide
-        (one row per slide and bin, contiguous: needs ``window_radius=None``), and the fitters add a random
-        level and a random curve per slide, so that the condition curves are compared against the variation
-        between slides rather than between cells (see ``diffsvg.tl.fit_model``).
+        Column in ``adata.obsm["design_matrix"]`` naming the biological replicate of every cell (e.g. donor,
+        animal or organoid), for data with several replicates per `condition`. Each replicate must belong to one
+        `condition`. Several sections of one donor are one replicate, so name the donor here, not the section.
+        Bins are then built per replicate (one row per replicate and bin, contiguous: needs
+        ``window_radius=None``), and the fitters add a random level and a random curve per replicate, so that
+        the condition curves are compared against the variation between replicates rather than between cells
+        (see ``diffsvg.tl.fit_model``).
     inplace
         If `True` (default), write ``adata.obs[f"{anchor}_bin"]`` (each
         cell's assigned bin index) and ``adata.uns["binned"]`` (everything

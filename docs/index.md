@@ -19,6 +19,7 @@ notebooks/single_slide_test
 :caption: Reference
 
 method.md
+settings.md
 api.md
 changelog.md
 contributing.md
