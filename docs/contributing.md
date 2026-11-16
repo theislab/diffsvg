@@ -252,7 +252,7 @@ Please adhere to [Semantic Versioning][semver], in brief
 > Additional labels for pre-release and build metadata are available as extensions to the MAJOR.MINOR.PATCH format.
 
 Once you are done, commit and push your changes and navigate to the "Releases" page of this project on GitHub.
-Specify `vX.X.X` as a tag name and create a release.
+Specify `vX.X.X` as a tag name, write the release notes (diffsvg keeps no changelog file), and create the release.
 For more information, see [managing GitHub releases][].
 This will automatically create a git tag and trigger a Github workflow that creates a release on [PyPI][].
 
