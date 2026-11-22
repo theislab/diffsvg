@@ -341,6 +341,9 @@ class _ProfileShared:
     priors: dict
     B_pred: np.ndarray
     weights: np.ndarray | None = None
+    # The slide of every fitted row and the number of slides, for fits with `sample`.
+    sample_index: np.ndarray | None = None
+    n_samples: int | None = None
 
 
 def _fitted_cells(design, binned):
@@ -790,8 +793,46 @@ def _exact_gene_results(shared, Y, genes, ss_within, settings):
     return results
 
 
+def _exact_profile_slide_results(shared, Y, genes, ss_within, settings):
+    """Exact inference for the condition-free model with a random level and curve per slide."""
+    priors = _resolve_priors(shared.priors)
+    K = shared.n_bsplines
+    fixed = np.column_stack([np.ones(shared.B.shape[0]), shared.B])
+    X = _exact.slide_design(fixed, shared.B, np.asarray(shared.sample_index, dtype=int), shared.n_samples)
+    m0 = np.concatenate([[priors["intercept"][1]], [priors["beta"][1]] * K])
+    s0 = np.concatenate([[priors["intercept"][2]], [priors["beta"][2]] * K])
+    Ymat = np.column_stack([np.asarray(Y[g], dtype=float) for g in genes])
+    extra_df = extra_ss = None
+    if ss_within is not None:
+        extra_df = ss_within[genes[0]][1]
+        extra_ss = np.array([ss_within[g][0] for g in genes])
+    res = _exact.slide_posterior(
+        X, Ymat, shared.weights, fixed.shape[1], shared.n_samples, K, m0, s0, priors["sigma"],
+        priors["sample_level_sd"], priors["sample_curve_sd"], extra_df, extra_ss, n_draws=settings["draws"],
+        seeds=np.random.SeedSequence(settings["random_seed"]).spawn(len(genes)), n_hyper=settings.get("n_hyper", 72),
+    )  # fmt: skip
+    A = np.column_stack([np.ones(shared.B_pred.shape[0]), shared.B_pred])
+    results = []
+    for i, gene in enumerate(genes):
+        curves = res["draws"][i] @ A.T
+        ci_low, ci_high = np.quantile(curves, [0.03, 0.97], axis=0)
+        diag_row = {
+            "gene": gene,
+            "sigma_mean": float(np.sqrt(res["sigma2_mean"][i])),
+            "sample_level_sd": float(res["level_sd_mean"][i]),
+            "sample_curve_sd": float(res["curve_sd_mean"][i]),
+            "exact_edge_mass": float(res["edge_mass"][i]),
+        }
+        curve_row = {"mean": A @ res["mean"][i], "ci_low": ci_low, "ci_high": ci_high, "beta": res["mean"][i][1:],
+                     "beta_cov": res["cov"][i][1:, 1:]}  # fmt: skip
+        results.append((gene, diag_row, curve_row))
+    return results
+
+
 def _exact_profile_results(shared, Y, genes, ss_within, settings):
     """Exact inference for the condition-free model: ``[(gene, diag_row, curve_row), ...]``."""
+    if shared.sample_index is not None:
+        return _exact_profile_slide_results(shared, Y, genes, ss_within, settings)
     design = np.column_stack([np.ones(shared.B.shape[0]), shared.B])
     post = _exact_fit(design, Y, genes, shared.weights, ss_within, _resolve_priors(shared.priors),
                       ("intercept", "beta"), shared.n_bsplines, settings)  # fmt: skip
@@ -1632,6 +1673,11 @@ def fit_profiles(
     to what `one_vs_rest` does by default there (averaging the two fitted
     condition curves), and the two need not agree exactly.
 
+    `flatness_test` tests each curve against a flat line. Data binned with
+    `sample` (``bin_obs(..., sample=...)``, with or without a condition) get
+    a random level and a random curve per slide (exact inference only), so
+    the stored covariance of `beta` holds the variation between slides.
+
     Parameters
     ----------
     adata
@@ -1660,12 +1706,15 @@ def fit_profiles(
     if inference not in ("auto", "exact", "nuts"):
         raise ValueError(f"Unknown inference {inference!r} for fit_profiles. Available: ['auto', 'exact', 'nuts']")
     priors = _resolve_priors(model_setup.priors)
+    has_samples = model_setup.binned.sample is not None
+    scales = ("sigma", "sample_level_sd", "sample_curve_sd") if has_samples else ("sigma",)
     exact_ok = (
         model_setup.likelihood == "normal"
-        and model_setup.binned.sample is None
         and all(priors[n][0] == "normal" for n in ("intercept", "beta"))
-        and priors["sigma"][0] in _exact._SIGMA_LOGPDF
+        and all(priors[n][0] in _exact._SIGMA_LOGPDF for n in scales)
     )
+    if has_samples and inference == "nuts":
+        raise ValueError("`fit_profiles` models slides with exact inference only; use inference='exact' or 'auto'.")
     if inference == "exact" and not exact_ok:
         raise ValueError("inference='exact' needs the normal likelihood and normal priors on the coefficients.")
     inference = ("exact" if exact_ok else "nuts") if inference == "auto" else inference
@@ -1688,9 +1737,12 @@ def fit_profiles(
         sample_defaults.update(pymc_kwargs)
 
     binned = model_setup.binned
-    if binned.sample is not None:
-        raise ValueError("`fit_profiles` does not model slides; bin without `sample`.")
+    if has_samples and inference != "exact":
+        raise ValueError("`fit_profiles` models slides with exact inference only (the priors must allow it).")
     B, _, _, Y, intercept_initvals = _fit_inputs(adata, binned, use_binned)
+    sample_index, n_samples = _sample_inputs(adata, binned, use_binned)
+    if n_samples is not None and n_samples < 2:
+        raise ValueError(f"A curve across slides needs at least 2 slides, found {n_samples}.")
     weights, ss_within, n_obs_grid = _weighting(binned, use_binned)
     fit_genes = _fittable_genes(binned.genes, Y)
     shared = _ProfileShared(
@@ -1701,6 +1753,8 @@ def fit_profiles(
         B_pred=binned.B_pred,
         weights=weights,
         # One pooled curve: with conditions binned separately, a grid point holds both levels' cells.
+        sample_index=sample_index,
+        n_samples=n_samples,
     )
 
     n_jobs = 1 if n_workers is None else n_workers
@@ -1752,6 +1806,8 @@ def fit_profiles(
         "genes": np.asarray(fitted, dtype=str),
         "cov": np.stack([curve_rows[g]["beta_cov"] for g in fitted]),
         "degree": int(binned.degree),
+        # Slides of a fit with `sample` (0 without): `flatness_test` then uses an F reference.
+        "n_samples": int(n_samples or 0),
     }
     return None
 
@@ -1878,6 +1934,71 @@ def one_vs_rest(
 
     if inplace:
         adata.varm[key_added or f"dsvg_ovr_{gene}"] = result.reindex(adata.var_names)
+    return result
+
+
+def flatness_test(adata, profiles_key="dsvg_profiles", tau=None, inplace=True, key_added=None):
+    """Test, per gene, whether its `fit_profiles` curve changes along the anchor or is flat.
+
+    The curve test of `parallel_curves_test` applied to the single curve: its coefficients `beta` (with their
+    posterior covariance, stored by `fit_profiles`) against the best flat line at any height. The shape is
+    ``sqrt(12) * RMS(f - mean f)`` over ``[0, 1]`` (`shape_metric`: ``|slope|`` for a straight line), so the
+    level drops out; ``H0: shape <= tau``. For a fit with slides (``bin_obs(..., sample=...)``) the covariance
+    holds the variation between slides and the p-value uses an F reference with ``n_slides - 1`` denominator
+    degrees of freedom; without slides every cell is an independent replicate (chi-square reference).
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix that `fit_profiles` wrote into (``inplace=True``).
+    profiles_key
+        Prefix passed to `fit_profiles`.
+    tau
+        Smallest shape that counts, in expression units per unit of the anchor axis. Defaults to ``0`` for a
+        fit with slides and ``0.1`` without, as in `fit_model`.
+    inplace
+        If `True` (default), also write the table to ``adata.var`` as ``f"{key_added}_{column}"``.
+    key_added
+        Prefix of the `adata.var` columns; defaults to ``f"{profiles_key}_flat"``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by the fitted genes: ``shape``, ``stat`` (Wald statistic, a ranking score), ``df``,
+        ``df_denominator`` (NaN without slides), ``pval`` and ``pval_adj`` (Benjamini-Hochberg).
+    """
+    cov_key = f"{profiles_key}_beta_cov"
+    if cov_key not in adata.uns or f"{profiles_key}_beta" not in adata.varm:
+        raise KeyError(f"adata.uns[{cov_key!r}] not found - run `diffsvg.tl.fit_profiles(..., inplace=True)` first.")
+    stored = adata.uns[cov_key]
+    genes = [str(g) for g in stored["genes"]]
+    covs = np.asarray(stored["cov"], dtype=float)
+    betas = adata.varm[f"{profiles_key}_beta"].loc[genes].to_numpy(dtype=float)
+    n_samples = int(stored.get("n_samples", 0) or 0)
+    if tau is None:
+        tau = 0.0 if n_samples else 0.1
+    if tau < 0:
+        raise ValueError(f"`tau` must be >= 0, got {tau}.")
+    df_denominator = n_samples - 1 if n_samples else None
+    metric = shape_metric(covs.shape[1], int(stored["degree"]))
+    rows = [parallel_curves_test(b, metric, tau=tau, cov=c, df_denominator=df_denominator) for b, c in zip(betas, covs, strict=True)]
+    shape, stat, df, pval = (np.asarray(v, dtype=float) for v in zip(*rows, strict=True)) if rows else ([],) * 4
+    result = pd.DataFrame(
+        {
+            "shape": shape,
+            "stat": stat,
+            "df": df,
+            "df_denominator": float("nan") if df_denominator is None else float(df_denominator),
+            "pval": pval,
+        },
+        index=pd.Index(genes, name="gene"),
+    )
+    result["pval_adj"] = _benjamini_hochberg(result["pval"].to_numpy()) if len(result) else []
+    result.attrs.update({"tau": float(tau), "n_samples": n_samples})
+    if inplace:
+        prefix = key_added or f"{profiles_key}_flat"
+        for column in result.columns:
+            adata.var[f"{prefix}_{column}"] = result[column].reindex(adata.var_names)
     return result
 
 
