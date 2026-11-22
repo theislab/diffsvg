@@ -58,8 +58,9 @@ def test_sample_must_be_nested_in_condition_and_needs_contiguous_bins():
     dm = adata.obsm["design_matrix"]
     with pytest.raises(ValueError, match="window_radius"):
         dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", sample="slide", window_radius=0.02, inplace=False)
-    with pytest.raises(ValueError, match="needs a `condition`"):
-        dvg.pp.bin_obs(adata, anchor="anchor", condition=None, sample="slide", window_radius=None, inplace=False)
+    # without a condition the slides feed one curve (fit_profiles), one row per slide and bin
+    b = dvg.pp.bin_obs(adata, anchor="anchor", condition=None, sample="slide", window_radius=None, inplace=False)
+    assert b.n_samples == 10 and b.condition_fit is None
     dm.loc[dm["slide"] == "s0", "condition"] = "b"  # move slide s0 to condition b ...
     dm.loc[dm.index[:10], "condition"] = "a"  # ... except for ten cells, so it now has two conditions
     with pytest.raises(ValueError, match="nested"):
@@ -142,15 +143,18 @@ def test_slides_stop_the_pooled_overconfidence():
     assert np.isfinite(curves["cond0_mean"].to_numpy()).all()
 
 
-def test_slide_aware_fits_run_every_test_but_refuse_profiles():
+def test_slide_aware_fits_run_every_test_and_profiles():
     adata = _slides(n_per_slide=100)
     dvg.pp.bin_obs(adata, anchor="anchor", condition="condition", n_bins=N_BINS, window_radius=None, sample="slide")
     setup = dvg.tl.setup_model(adata)
     for test in ("wald", "level"):
         stats, _, _ = dvg.tl.fit_model(adata, setup, test=test, inplace=False, progressbar=False)
         assert stats[f"{test}_df_denominator"].iloc[0] == 8
-    with pytest.raises(ValueError, match="does not model slides"):
-        dvg.tl.fit_profiles(adata, setup, inplace=False)
+    # profiles pool both conditions into one curve, with the slide effects (exact only)
+    dvg.tl.fit_profiles(adata, setup, progressbar=False, sample_kwargs={"n_hyper": 16})
+    assert dvg.tl.flatness_test(adata)["df_denominator"].iloc[0] == 9
+    with pytest.raises(ValueError, match="exact inference only"):
+        dvg.tl.fit_profiles(adata, setup, inplace=False, inference="nuts")
 
 
 def test_cells_without_a_sample_are_left_out_of_the_binning():

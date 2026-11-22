@@ -469,6 +469,9 @@ def bin_obs(
         ``window_radius=None``), and the fitters add a random level and a random curve per replicate, so that
         the condition curves are compared against the variation between replicates rather than between cells
         (see ``diffsvg.tl.fit_model``).
+        Without a `condition` (``condition=None``) the replicates feed one curve, fitted by
+        ``diffsvg.tl.fit_profiles`` with the same random level and curve per replicate, so that
+        ``diffsvg.tl.flatness_test`` compares the common curve against the variation between replicates.
     inplace
         If `True` (default), write ``adata.obs[f"{anchor}_bin"]`` (each
         cell's assigned bin index) and ``adata.uns["binned"]`` (everything
@@ -484,8 +487,6 @@ def bin_obs(
         if col is not None and col not in design_matrix_df.columns:
             raise KeyError(f"{col!r} not found in adata.obsm[{design_matrix!r}]")
     if sample is not None:
-        if condition is None:
-            raise ValueError("`sample` needs a `condition`: it exists to compare conditions across replicates.")
         if window_radius is not None:
             raise ValueError("`sample` needs contiguous bins - pass `window_radius=None`.")
 
@@ -525,19 +526,23 @@ def bin_obs(
 
     sample_labels = sample_index = None
     if sample is not None:
-        # Rows are (sample, bin); each sample's rows get its condition.
-        pairs = design_matrix_df[[sample, condition]].dropna().drop_duplicates()
-        pairs[sample] = pairs[sample].astype(str)
-        mixed = pairs[sample][pairs[sample].duplicated()].unique()
-        if len(mixed):
-            raise ValueError(f"`sample` must be nested in `condition`; these samples have several: {sorted(mixed)}")
-        sample_condition = dict(zip(pairs[sample], pairs[condition], strict=True))
+        # Rows are (sample, bin); each sample's rows get its condition (if there is one).
+        if condition is not None:
+            pairs = design_matrix_df[[sample, condition]].dropna().drop_duplicates()
+            pairs[sample] = pairs[sample].astype(str)
+            mixed = pairs[sample][pairs[sample].duplicated()].unique()
+            if len(mixed):
+                raise ValueError(
+                    f"`sample` must be nested in `condition`; these samples have several: {sorted(mixed)}"
+                )
+            sample_condition = dict(zip(pairs[sample], pairs[condition], strict=True))
         sample_labels = sorted({str(v) for v in binned[genes[0]][sample]})
         position = {label: i for i, label in enumerate(sample_labels)}
         sample_index = binned[genes[0]][sample].astype(str).map(position).to_numpy(dtype=int)
-        for gene in genes:
-            frame = binned[gene]
-            frame[condition] = frame[sample].astype(str).map(sample_condition)
+        if condition is not None:
+            for gene in genes:
+                frame = binned[gene]
+                frame[condition] = frame[sample].astype(str).map(sample_condition)
 
     # Encode `condition` to 0.0/1.0 so it can be used directly as a numeric
     # covariate; keep the original labels around for interpretability.
